@@ -1,13 +1,12 @@
 import { createHash } from 'node:crypto'
 import { lstat, mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { pathToFileURL } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
 import { Service } from '@deepseek-ai/cordis'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
-import { defineTool } from '@deepseek-ai/dsh-tools'
 import { z } from 'zod'
 import { acquireWriterLease } from './writer-lease-lock.js'
+import { PrismToolsetRuntime, PrismToolsetRuntimeError } from './toolset-runtime.js'
 
 export const name = 'prismflow-store-toolsets'
 export const inject = ['storageDomain', 'tools']
@@ -230,8 +229,11 @@ export class PrismToolsetStore extends Service {
     this.pluginRoot = config.pluginRoot || (this.skillRoot ? join(dirname(this.skillRoot), 'plugins', 'prismflow-personal') : '')
     this.personalPluginManifests = new Map()
     this.removedBundledPluginIds = new Set()
-    this.personalPluginDisposers = new Map()
     this.nativeToolDisposers = new Map()
+    this.toolsetRuntime = new PrismToolsetRuntime(this)
+    this.runtimeLive = false
+    this.runtimeDeniedTools = new Set()
+    this.disposing = false
     this.releaseWriterLock = undefined
     this.domain = undefined
     this.table = undefined
@@ -252,16 +254,22 @@ export class PrismToolsetStore extends Service {
       await this.bootstrapPromptSuggestions()
       await this.activatePersonalPlugins()
       this.ctx.effect(() => async () => {
+        this.disposing = true
         await this.tail.catch(() => {})
         const domain = this.domain; const release = this.releaseWriterLock
-        this.table = undefined; this.domain = undefined; this.releaseWriterLock = undefined
-        const disposers = [...this.personalPluginDisposers.values()].flat(); this.personalPluginDisposers.clear()
-        const results = await Promise.allSettled([...disposers.map(dispose => Promise.resolve().then(dispose)), domain?.close(), release?.()])
-        const failures = results.filter(result => result.status === 'rejected').map(result => result.reason)
+        const failures = []
+        try { await this.toolsetRuntime.close() } catch (error) { failures.push(error) }
+        const cleanup = await Promise.allSettled([...this.nativeToolDisposers.values()].map(dispose => dispose()))
+        failures.push(...cleanup.filter(result => result.status === 'rejected').map(result => result.reason))
+        this.table = undefined; this.domain = undefined; this.releaseWriterLock = undefined; this.runtimeLive = false
+        const results = await Promise.allSettled([domain?.close(), release?.()])
+        failures.push(...results.filter(result => result.status === 'rejected').map(result => result.reason))
         if (failures.length === 1) throw failures[0]
         if (failures.length > 1) throw new AggregateError(failures, 'PrismFlow Toolset close failed')
       }, 'prismflow-toolsets.close')
     } catch (error) {
+      this.runtimeLive = false
+      await this.toolsetRuntime.close().catch(() => {})
       this.table = undefined
       await this.domain?.close().catch(() => {}); this.domain = undefined
       await this.releaseWriterLock?.().catch(() => {}); this.releaseWriterLock = undefined
@@ -269,14 +277,25 @@ export class PrismToolsetStore extends Service {
     }
   }
   requireTable() { if (!this.table) throw new Error('PrismFlow Toolset Store is not initialized'); return this.table }
-  mutate(work) { const run = this.tail.catch(() => {}).then(work); this.tail = run.catch(() => {}); return run }
+  mutate(work) {
+    if (this.disposing) return Promise.reject(new PrismToolsetRuntimeError('PrismFlow toolset is stopping'))
+    const run = this.tail.catch(() => {}).then(work); this.tail = run.catch(() => {}); return run
+  }
   notify() { for (const listener of this.listeners) { try { listener() } catch {} } }
   trackNativeTool(name, dispose) {
     if (typeof dispose !== 'function') return dispose
-    let active = true
-    const tracked = async () => { if (!active) return; active = false; if (this.nativeToolDisposers.get(name) === tracked) this.nativeToolDisposers.delete(name); await dispose() }
+    let active = true, pending
+    const tracked = () => {
+      if (!active) return Promise.resolve()
+      if (!pending) pending = Promise.resolve().then(dispose).then(() => {
+        active = false
+        if (this.nativeToolDisposers.get(name) === tracked) this.nativeToolDisposers.delete(name)
+      }, error => { pending = undefined; throw error })
+      return pending
+    }
     this.nativeToolDisposers.set(name, tracked); return tracked
   }
+  registerNativeTool(ctx, definition) { this.runtimeLive = true; return this.toolsetRuntime.registerNative(ctx, definition) }
   subscribe(listener) { this.listeners.add(listener); return () => this.listeners.delete(listener) }
   skillRows(skillId) {
     const rows = []
@@ -337,7 +356,7 @@ export class PrismToolsetStore extends Service {
     return { ...manifest, directory, entryPath, entryMtimeMs: entryStat.mtimeMs }
   }
   assertPluginCollision(manifest, ignoredPluginId) {
-    const catalog = [...PRISMFLOW_PLUGIN_MANIFESTS.filter(plugin => plugin.origin === 'system').map(plugin => ({ ...plugin, tools: [...plugin.tools] })), ...[...this.personalPluginManifests.values()]].filter(plugin => plugin.pluginId !== ignoredPluginId)
+    const catalog = [...PRISMFLOW_PLUGIN_MANIFESTS.filter(plugin => plugin.origin === 'system' || plugin.pluginId !== manifest.pluginId).map(plugin => ({ ...plugin, tools: [...plugin.tools] })), ...[...this.personalPluginManifests.values()]].filter(plugin => plugin.pluginId !== ignoredPluginId)
     if (catalog.some(plugin => plugin.pluginId === manifest.pluginId)) throw new PrismToolsetConflictError('Personal plugin ID already exists')
     const claimed = new Set(catalog.flatMap(plugin => plugin.tools))
     if (manifest.tools.some(tool => claimed.has(tool))) throw new PrismToolsetConflictError('Personal plugin tool name already exists')
@@ -354,29 +373,8 @@ export class PrismToolsetStore extends Service {
     }
   }
   async activatePersonalPlugins() {
-    const enabled = new Set(this.getToolset().enabledPlugins ?? [])
-    for (const manifest of this.personalPluginManifests.values()) {
-      if (!manifest.uploaded || !enabled.has(manifest.pluginId)) continue
-      const disposers = []; const registered = new Set()
-      const api = Object.freeze({
-        pluginId: manifest.pluginId,
-        getService: name => this.ctx.get?.(name),
-        registerTool: definition => {
-          if (!definition || typeof definition !== 'object' || !manifest.tools.includes(definition.name) || registered.has(definition.name)) throw new Error(`Personal plugin registered an undeclared or duplicate tool: ${manifest.pluginId}`)
-          const dispose = this.ctx.tools.register(defineTool(definition)); if (typeof dispose === 'function') disposers.push(dispose); registered.add(definition.name)
-        },
-      })
-      try {
-        const module = await import(`${pathToFileURL(manifest.entryPath).href}?v=${encodeURIComponent(String(manifest.entryMtimeMs))}`)
-        if (typeof module.default !== 'function') throw new Error('Personal plugin entry must default-export activate(api)')
-        const returned = await module.default(api); if (typeof returned === 'function') disposers.push(returned)
-        if (registered.size !== manifest.tools.length) throw new Error(`Personal plugin did not register every declared tool: ${manifest.pluginId}`)
-        this.personalPluginDisposers.set(manifest.pluginId, disposers)
-      } catch (error) {
-        await Promise.allSettled(disposers.map(dispose => Promise.resolve().then(dispose)))
-        throw new Error(`Failed to activate personal plugin ${manifest.pluginId}: ${error?.message ?? error}`, { cause: error })
-      }
-    }
+    await this.toolsetRuntime.reconcile(this.getToolset())
+    this.runtimeLive = true
   }
   installPersonalPlugin(files) { return this.mutate(async () => {
     if (!Array.isArray(files) || files.length < 2 || files.length > 32) invalid('Personal plugin Bundle files are invalid')
@@ -409,12 +407,12 @@ export class PrismToolsetStore extends Service {
     const current = this.getToolset(); const ref = expected(input.expected)
     if (ref.version !== current.version || ref.sha256 !== current.sha256) throw new PrismToolsetConflictError('Toolset version conflict')
     if (current.enabledPlugins.includes(pluginId)) throw new PrismToolsetConflictError('Disable the personal plugin and save before deletion')
-    const disposers = [...(this.personalPluginDisposers.get(pluginId) ?? []), ...manifest.tools.map(tool => this.nativeToolDisposers.get(tool)).filter(Boolean)]
+    await this.toolsetRuntime.deactivatePersonal(pluginId)
+    const disposers = manifest.tools.map(tool => this.nativeToolDisposers.get(tool)).filter(Boolean)
     const disposal = await Promise.allSettled(disposers.map(dispose => Promise.resolve().then(dispose)))
     const failures = disposal.filter(result => result.status === 'rejected').map(result => result.reason)
     if (failures.length === 1) throw failures[0]
     if (failures.length > 1) throw new AggregateError(failures, `Failed to deactivate personal plugin ${pluginId}`)
-    this.personalPluginDisposers.delete(pluginId)
     const bundled = manifest.bundled === true; const target = manifest.directory || join(this.pluginRoot, pluginId); const hasPhysicalDirectory = typeof manifest.directory === 'string'
     const staged = hasPhysicalDirectory ? join(dirname(this.pluginRoot), `.prismflow-plugin-delete-${pluginId}-${process.pid}-${Date.now()}`) : ''
     if (hasPhysicalDirectory) await rename(target, staged)
@@ -485,8 +483,9 @@ export class PrismToolsetStore extends Service {
           JSON.stringify([...PRISMFLOW_TOOL_NAMES.slice(0, length)].sort()),
           JSON.stringify([...LEGACY_PRISMFLOW_TOOL_NAMES.slice(0, length)].sort()),
         ])
+        const missingPersonalPlugin = current.enabledPlugins?.some(id => PERSONAL_PLUGIN_ID.test(id) && !this.pluginIds().includes(id))
         if (JSON.stringify(renamedTools) !== JSON.stringify(expectedComplete)
-          && !renamedTools.every(tool => PRISMFLOW_TOOL_NAMES.includes(tool) || RETIRED_TOOL_NAMES.has(tool))
+          && !renamedTools.every(tool => PRISMFLOW_TOOL_NAMES.includes(tool) || RETIRED_TOOL_NAMES.has(tool) || missingPersonalPlugin && TOOL_NAME.test(tool))
           && !supportedPrevious.includes(JSON.stringify(current.enabledTools))) {
           throw new Error('Complete PrismFlow Toolset does not match a supported schema revision')
         }
@@ -589,7 +588,12 @@ export class PrismToolsetStore extends Service {
     if (stagedBundle) await rm(staged, { recursive: true, force: true })
     this.notify(); return projectSkill(row)
   }) }
-  listPlugins() { return this.pluginCatalog().map(({ directory: _directory, entryPath: _entryPath, entryMtimeMs: _entryMtimeMs, format: _format, entry: _entry, ...plugin }) => plugin) }
+  listPlugins() {
+    const selection = this.getToolset()
+    return this.pluginCatalog().map(({ directory: _directory, entryPath: _entryPath, entryMtimeMs: _entryMtimeMs, format: _format, entry: _entry, ...plugin }) => ({
+      ...plugin, runtime: this.toolsetRuntime.status(plugin, selection),
+    }))
+  }
   getToolset({ allowUnavailable = false } = {}) {
     const row = this.requireTable().get(TOOLSET_KEY)
     const legacy = row && exact(row, ['mode', 'enabledTools', 'enabledSkills', 'version', 'sha256', 'updatedAt'])
@@ -600,15 +604,26 @@ export class PrismToolsetStore extends Service {
       ? { mode: row.mode, enabledPlugins: row.enabledPlugins, enabledTools: row.enabledTools, enabledSkills: row.enabledSkills, version: row.version }
       : { mode: row.mode, enabledTools: row.enabledTools, enabledSkills: row.enabledSkills, version: row.version }
     if (digest(hashInput) !== row.sha256) throw new Error('PrismFlow Toolset is missing or corrupt')
-    const catalog = allowUnavailable ? PRISMFLOW_PLUGIN_MANIFESTS : this.pluginCatalog()
+    const physicalCatalog = this.pluginCatalog()
+    const catalog = allowUnavailable
+      ? [...new Map([...PRISMFLOW_PLUGIN_MANIFESTS, ...physicalCatalog].map(plugin => [plugin.pluginId, plugin])).values()]
+      : physicalCatalog
     const catalogTools = catalog.flatMap(plugin => plugin.tools)
     const catalogPluginIds = catalog.map(plugin => plugin.pluginId)
-    sortedUnique(row.enabledTools, new Set([...catalogTools, ...Object.keys(LEGACY_TOOL_NAMES), ...RETIRED_TOOL_NAMES]), 'enabledTools')
+    // Configuration backups do not carry uploaded code. Admit only well-formed
+    // missing personal identities during bootstrap, so reconciliation can drop
+    // their unavailable references. This never registers or grants a tool.
+    const missingPersonalPlugins = allowUnavailable && Array.isArray(row.enabledPlugins)
+      ? row.enabledPlugins.filter(id => typeof id === 'string' && id.length <= 128 && PERSONAL_PLUGIN_ID.test(id) && !catalogPluginIds.includes(id)) : []
+    const orphanTools = missingPersonalPlugins.length && Array.isArray(row.enabledTools)
+      ? row.enabledTools.filter(tool => typeof tool === 'string' && tool.length <= 96 && TOOL_NAME.test(tool) && !catalogTools.includes(tool)
+        && !Object.hasOwn(LEGACY_TOOL_NAMES, tool) && !RETIRED_TOOL_NAMES.has(tool)) : []
+    sortedUnique(row.enabledTools, new Set([...catalogTools, ...Object.keys(LEGACY_TOOL_NAMES), ...RETIRED_TOOL_NAMES, ...orphanTools]), 'enabledTools')
     if (current) {
-      sortedUnique(row.enabledPlugins, new Set([...catalogPluginIds, ...Object.keys(LEGACY_PLUGIN_IDS)]), 'enabledPlugins')
+      sortedUnique(row.enabledPlugins, new Set([...catalogPluginIds, ...Object.keys(LEGACY_PLUGIN_IDS), ...missingPersonalPlugins]), 'enabledPlugins')
       const normalizedPlugins = row.enabledPlugins.map(id => LEGACY_PLUGIN_IDS[id] ?? id)
       const allowedTools = new Set(catalog.filter(plugin => normalizedPlugins.includes(plugin.pluginId)).flatMap(plugin => plugin.tools))
-      if (row.enabledTools.some(tool => !RETIRED_TOOL_NAMES.has(tool) && !allowedTools.has(LEGACY_TOOL_NAMES[tool] ?? tool))) throw new Error('PrismFlow Toolset contains a tool whose plugin is disabled')
+      if (row.enabledTools.some(tool => !RETIRED_TOOL_NAMES.has(tool) && !allowedTools.has(LEGACY_TOOL_NAMES[tool] ?? tool) && !orphanTools.includes(tool))) throw new Error('PrismFlow Toolset contains a tool whose plugin is disabled')
     }
     if (!Array.isArray(row.enabledSkills) || row.enabledSkills.length > 256 || new Set(row.enabledSkills).size !== row.enabledSkills.length || row.enabledSkills.some(id => !SKILL_ID.test(id))) throw new Error('PrismFlow Toolset is corrupt')
     return structuredClone(row)
@@ -630,7 +645,7 @@ export class PrismToolsetStore extends Service {
     const row = { ...snapshot, sha256: digest(snapshot), updatedAt: new Date().toISOString() }
     await this.requireTable().put(PROMPT_SUGGESTIONS_KEY, row); this.notify(); return structuredClone(row)
   }) }
-  isToolEnabled(name) { return this.getToolset().enabledTools.includes(name) }
+  isToolEnabled(name) { return !this.disposing && !this.runtimeDeniedTools.has(name) && this.getToolset().enabledTools.includes(name) }
   activeSkills() { const selected = new Set(this.getToolset().enabledSkills); return this.listSkills().filter(skill => skill.enabled && selected.has(skill.skillId)) }
   saveToolset(input) { return this.mutate(async () => {
     const legacyInput = exact(input, ['mode', 'enabledTools', 'enabledSkills', 'expected'])
@@ -662,12 +677,39 @@ export class PrismToolsetStore extends Service {
         : requestedSkills
     const snapshot = { mode: input.mode, enabledPlugins, enabledTools, enabledSkills, version: current.version + 1 }
     const row = { ...snapshot, sha256: digest(snapshot), updatedAt: new Date().toISOString() }
-    await this.requireTable().put(TOOLSET_KEY, row); await this.requireTable().put(toolsetHistoryKey(row.version), row); this.notify(); return structuredClone(row)
+    const table = this.requireTable(); const historyKey = toolsetHistoryKey(row.version)
+    if (table.get(historyKey) !== undefined) throw new PrismToolsetConflictError('Toolset history revision is already reserved')
+    this.runtimeDeniedTools = new Set([...current.enabledTools.filter(name => !enabledTools.includes(name)), ...enabledTools.filter(name => !current.enabledTools.includes(name))])
+    try {
+      // New registrations remain admission-blocked until both persistence and
+      // runtime reconciliation succeed. Disabled cached definitions deny now.
+      await table.put(historyKey, row)
+      await table.put(TOOLSET_KEY, row)
+      if (this.runtimeLive) {
+        const requiredTools = this.pluginCatalog().filter(plugin => plugin.origin === 'personal' && enabledPlugins.includes(plugin.pluginId))
+          .flatMap(plugin => plugin.tools).filter(name => enabledTools.includes(name))
+        await this.toolsetRuntime.reconcile(row, requiredTools)
+      }
+      this.runtimeDeniedTools.clear()
+      this.notify()
+      return structuredClone(row)
+    } catch (error) {
+      const failures = []
+      try { await table.put(TOOLSET_KEY, current) } catch (rollbackError) { failures.push(rollbackError) }
+      try { if (table.get(historyKey)?.sha256 === row.sha256) await table.delete(historyKey) } catch (rollbackError) { failures.push(rollbackError) }
+      if (this.runtimeLive) try { await this.toolsetRuntime.reconcile(current) } catch (rollbackError) { failures.push(rollbackError) }
+      if (!failures.length) this.runtimeDeniedTools.clear()
+      throw new PrismToolsetRuntimeError(failures.length
+        ? 'Toolset runtime change failed; rollback was incomplete and changed tools remain blocked'
+        : `Toolset runtime change failed; the previous selection and registrations were restored${error instanceof PrismToolsetRuntimeError ? ` (${error.message})` : ''}`,
+      new AggregateError([error, ...failures]))
+    }
   }) }
 }
 
 export function registerPrismFlowTool(ctx, definition) {
   const manager = ctx.get?.('prismToolsets')
+  if (typeof manager?.registerNativeTool === 'function') return manager.registerNativeTool(ctx, definition)
   if (manager && !manager.isToolEnabled(definition.name)) return () => {}
   const dispose = ctx.tools.register(definition)
   return manager?.trackNativeTool?.(definition.name, dispose) ?? dispose

@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { startPrismFlowSubagent } from './subagent-compat.js'
 import Schema from '@deepseek-ai/schemastery'
 import {
   buildProductionPrompt,
@@ -202,7 +203,7 @@ async function runStage(ctx, generator, execution, controller, stage, prompt, pe
   throwIfAborted(controller.signal, stage)
   let run
   try {
-    run = await ctx.subagents.start(generator.subagentProvider ?? generator.providerRef, {
+    run = await startPrismFlowSubagent(ctx, generator.subagentProvider ?? generator.providerRef, {
       label: `PrismFlow ${generator.id} ${stage}`,
       prompt: [{ type: 'text', text: prompt }], parent: execution.agent, signal: controller.signal,
       outputSchema: resultOnly ? RESULT_OUTPUT_SCHEMA : OUTPUT_SCHEMA,

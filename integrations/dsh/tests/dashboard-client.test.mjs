@@ -474,6 +474,53 @@ test('Chat prompt suggestion copy falls back when the Clipboard API is unavailab
   assert.ok(descendants(tree).some(node => node?.props?.['aria-label'] === '已复制候选文案：fallback'))
 })
 
+test('toolset catalog renders before optional cards finish and remains usable when every optional settings API fails', async () => {
+  const client = await loadClient(new Map([[0, 'toolsets'], [3, { ...status, services: { ...status.services, aiPrompts: true } }]]))
+  const initial = descendants(client.renderDashboard())
+  assert.equal(initial.includes('PrismFlow 工具集服务当前不可用。'), false)
+  const retry = initial.find(node => typeof node?.type === 'function' && descendants(node).includes('重新检测并加载'))
+  const loading = retry.props.onClick()
+  assert.equal(client.fetchCalls[0].url, '/api/prismflow/status')
+  client.pendingFetches[0]({ ok: true, async json() { return { ...status, services: { ...status.services, aiPrompts: true } } } })
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(client.fetchCalls[1].url, '/api/prismflow/toolsets')
+  const toolset = { mode: 'core', version: 1, sha256: 'a'.repeat(64), enabledPlugins: [], enabledTools: [], enabledSkills: [] }
+  client.pendingFetches[1]({ ok: true, async json() { return { toolset, plugins: [], skills: [] } } })
+  await new Promise(resolve => setImmediate(resolve))
+  let values = descendants(client.renderDashboard())
+  assert.ok(values.some(node => node?.props?.label === '插件与 Skill 配置模式'), 'catalog must not wait for optional cards')
+  client.pendingFetchRejects[2](new Error('private media failure details'))
+  client.pendingFetchRejects[3](new Error('private prompt failure details'))
+  client.pendingFetchRejects[4](new Error('private AI failure details'))
+  await loading
+  values = descendants(client.renderDashboard())
+  assert.ok(values.some(node => node?.props?.label === '插件与 Skill 配置模式'))
+  assert.ok(values.some(node => typeof node === 'string' && node.includes('工具集已加载；以下独立设置加载失败')))
+  assert.equal(values.some(node => typeof node === 'string' && node.includes('private ')), false)
+})
+
+test('failed store startup shows safe diagnostics, retries status and keeps encrypted configuration export reachable', async () => {
+  const unavailable = { ...status, services: { ...status.services, toolsets: false },
+    serviceDiagnostics: { toolsets: { state: 'foreign-host', message: '写入锁属于另一主机或旧容器。已拒绝自动接管。' } } }
+  const client = await loadClient(new Map([[0, 'toolsets'], [3, unavailable]]), { promptResult: 'correct horse battery staple' })
+  let values = descendants(client.renderDashboard())
+  assert.ok(values.includes('工具集存储服务未启动'))
+  assert.ok(values.includes(unavailable.serviceDiagnostics.toolsets.message))
+  const retry = values.find(node => typeof node?.type === 'function' && descendants(node).includes('重新检测并加载'))
+  const checking = retry.props.onClick()
+  client.pendingFetches[0]({ ok: true, async json() { return unavailable } })
+  await checking
+  assert.deepEqual(client.fetchCalls.map(call => call.url), ['/api/prismflow/status'])
+  values = descendants(client.renderDashboard())
+  const exportButton = values.find(node => typeof node?.type === 'function' && descendants(node).includes('导出全部配置'))
+  const exporting = exportButton.props.onClick()
+  assert.equal(client.fetchCalls[1].url, '/api/prismflow/configuration-backup/export')
+  client.pendingFetches[1]({ ok: true, async blob() { return new Blob(['encrypted-configuration']) } })
+  await exporting
+  assert.equal(client.downloads.length, 1)
+  assert.ok(client.downloads[0].download.endsWith('.pfbackup'))
+})
+
 test('toolset page exposes write-only image endpoint, model, size, encoding, and API Key controls', async () => {
   const imageSettings = { id: 'current', version: 3, sha256: '7'.repeat(64), imageApiUrl: 'https://images.example/v1/images/generations', imageApiProtocol: 'images-generations', imageModel: 'image-pro', imageSize: '1024x1024', avifQuality: '70', avifEffort: '5', ffmpegPath: '', updatedAt: '2026-01-01T00:00:00.000Z' }
   const toolset = { mode: 'complete', version: 3, sha256: '8'.repeat(64), enabledPlugins: ['prismflow-system-sources', 'prismflow-personal-image-generation'], enabledTools: ['prismflow_image_generation', 'prismflow_sources'], enabledSkills: ['prismflow-system', 'prismflow-personal'] }
@@ -1651,6 +1698,26 @@ test('publisher manager uses a channel rail, one-target editor, collapsed securi
   assert.match(client.appendedStyle.textContent, /pf-publisher-layout\{display:grid;grid-template-columns:260px minmax\(0,1fr\)/u)
   assert.match(client.appendedStyle.textContent, /pf-publisher-save-footer\.pf-publisher-changebar\{position:static/u)
   assert.doesNotMatch(client.appendedStyle.textContent, /pf-publisher-save-footer\.pf-publisher-changebar\{position:sticky/u)
+})
+
+test('an existing Local destination root is editable without replacing its immutable target ID', async () => {
+  const documentValue = publisherProfileDocumentForBrowser()
+  const rows = structuredClone(documentValue.rows)
+  const runtimeChannels = rows.map(row => ({ kind: row.channelKind, active: false, disabled: true, configured: true, destinations: [], configRevision: row.configRevision }))
+  const client = await loadClient(new Map([[0, 'publisher-profile'], [3, status], [24, runtimeChannels], [25, documentValue], [26, rows], [27, structuredClone(rows)]]))
+  let values = descendants(client.renderDashboard())
+  values.find(node => node?.type === 'button' && descendants(node).includes('本地 Markdown 存储')).props.onClick()
+  values = descendants(client.renderDashboard())
+  const root = values.find(node => typeof node?.type === 'function' && node.type.name === 'Field' && node.props.label === 'Local 根目录')
+  const id = values.find(node => typeof node?.type === 'function' && node.type.name === 'Field' && node.props.label === '目标 ID')
+  assert.equal(root.props.disabled, false)
+  assert.equal(id.props.disabled, true)
+  assert.match(root.props.help, /不会自动搬迁旧文件/u)
+  const target = rows.find(row => row.channelKind === 'local-markdown').config.destinations[0]
+  const nextRoot = `${process.cwd()}/local-next`
+  root.props.onChange(nextRoot)
+  const changed = client.stateSlots[26].find(row => row.channelKind === 'local-markdown').config.destinations[0]
+  assert.equal(changed.id, target.id); assert.equal(changed.root, nextRoot)
 })
 
 test('publisher target card accepts a write-only real credential and refreshes only redacted status', async () => {

@@ -18,8 +18,9 @@ const PROFILE_NAME = /^[A-Za-z0-9_-]{1,64}$/u
 const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/u
 
 function usage() {
-  console.error('Usage: prismflow-dsh-install [--profile <name>] [--dsh-home <path>] [--dsh-version <version>] [--migrate-json --confirm-dsh-stopped]')
+  console.error('Usage: prismflow-dsh-install [--profile <name>] [--dsh-home <path>] [--dsh-version <version>] [--recover-stopped-locks] [--migrate-json --confirm-dsh-stopped]')
   console.error('Legacy migration flags remain accepted, but JSON storage is now migrated automatically after active DSH processes are ruled out. Use prismflow-dsh-update for automatic stop, update, restart, and health checking.')
+  console.error('--recover-stopped-locks shortens only the dead-owner stale delay; it never bypasses a live, foreign-host, malformed, or unreadable lock. Stop every DSH process before using it.')
 }
 function fail(message) { throw new Error(`PrismFlow DSH installer: ${message}`) }
 function takeValue(args, index, option) {
@@ -189,8 +190,12 @@ function assertDshIsOffline(options) {
 
 async function acquireInstallationLocks(paths, recoverStoppedLocks = false) {
   const releases = []
+  let acquiringPath
   try {
-    for (const path of paths) releases.push(await acquireWriterLease(path, recoverStoppedLocks ? { staleAgeMs: 1 } : undefined))
+    for (const path of paths) {
+      acquiringPath = path
+      releases.push(await acquireWriterLease(path, recoverStoppedLocks ? { staleAgeMs: 1 } : undefined))
+    }
     return async () => {
       const failures = []
       for (const release of releases.reverse()) try { await release() } catch (error) { failures.push(error) }
@@ -198,7 +203,9 @@ async function acquireInstallationLocks(paths, recoverStoppedLocks = false) {
     }
   } catch (error) {
     for (const release of releases.reverse()) await release().catch(() => {})
-    throw new Error('PrismFlow DSH installer requires every DSH process using this home to be stopped', { cause: error })
+    const detail = error instanceof Error ? error.message : 'Unknown writer-lock failure'
+    const code = typeof error?.code === 'string' ? ` [${error.code}]` : ''
+    throw new Error(`PrismFlow installer could not acquire writer lock ${JSON.stringify(acquiringPath)}${code}: ${detail}`, { cause: error })
   }
 }
 
@@ -227,6 +234,8 @@ async function main() {
     configurePrismFlowRuntime(configureSqliteStorage(originalPatch, databasePath), binding.dshHome),
     binding,
   )
+
+  console.log(`PrismFlow target: DSH_HOME=${binding.dshHome}; Profile=${options.profileName}; DSH=${dshVersion}`)
 
   // Package installation, dependency mutation, Profile rewrites, and storage
   // migration all require one offline boundary. On first install there are no

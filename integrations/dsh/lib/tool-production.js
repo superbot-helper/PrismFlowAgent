@@ -2,7 +2,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { registerPrismFlowTool } from './store-prismflow-toolsets.js'
 
 export const name = 'prismflow-tool-production'
-export const inject = ['tools', 'prismProduction']
+export const inject = ['tools', 'prismProduction', 'prismToolsets']
 
 const EXPLICIT_CONTENT_IDS_TOOL = 'prismflow_create_generation_request_from_explicit_content_ids'
 

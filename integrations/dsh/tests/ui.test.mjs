@@ -1,13 +1,17 @@
 import assert from 'node:assert/strict'
 import { createServer, request as httpRequest } from 'node:http'
+import { createHash } from 'node:crypto'
+import { gzipSync } from 'node:zlib'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { networkInterfaces, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { DatabaseSync } from 'node:sqlite'
 import AdmZip from 'adm-zip'
+import { Context } from '@deepseek-ai/cordis'
+import { HostConnectionService } from '@deepseek-ai/dsh-client-connection'
 import YAML from 'yaml'
-import { decryptPrismFlowDataBackup, parsePrismFlowDataBackup, PRISMFLOW_DATA_UNITS } from '../lib/data-backup.js'
+import { decryptPrismFlowDataBackup, encryptPrismFlowDataBackup, parsePrismFlowDataBackup, PRISMFLOW_DATA_UNITS } from '../lib/data-backup.js'
 import { apply } from '../lib/ui.js'
 import { CategoryError } from '../lib/category-catalog.js'
 import { PublicationReconciliationError } from '../lib/store-production.js'
@@ -109,16 +113,17 @@ async function requestBytes(origin, path, headers = {}) {
   return { status: response.status, headers: response.headers, body: Buffer.from(await response.arrayBuffer()) }
 }
 
-async function requestWithHost(origin, path, host) {
+async function requestWithHost(origin, path, host, headers = {}, body) {
   const target = new URL(`/api/prismflow${path}`, origin)
   return new Promise((resolve, reject) => {
-    const outgoing = httpRequest(target, { method: 'GET', headers: { host } }, response => {
+    const outgoing = httpRequest(target, { method: body === undefined ? 'GET' : 'POST',
+      headers: { ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...headers, host } }, response => {
       const chunks = []
       response.on('data', chunk => chunks.push(chunk))
       response.on('end', () => resolve({ status: response.statusCode, value: JSON.parse(Buffer.concat(chunks).toString('utf8')) }))
     })
     outgoing.on('error', reject)
-    outgoing.end()
+    outgoing.end(body === undefined ? undefined : JSON.stringify(body))
   })
 }
 
@@ -130,7 +135,12 @@ function createBackupDatabase(path, marker) {
     for (const table of unit.tables) {
       const physical = `u_${unit.name}_${table}`
       db.exec(`CREATE TABLE "${physical}" (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT`)
-      db.prepare(`INSERT INTO "${physical}" (key, value) VALUES (?, ?)`).run(`${unit.name}:${table}`, JSON.stringify({ marker }))
+      if (unit.name === 'prismflow_source_settings' && table === 'sources') {
+        db.prepare(`INSERT INTO "${physical}" (key, value) VALUES (?, ?)`).run('rss:backup-fixture', JSON.stringify({
+          settingsId: 'rss:backup-fixture', type: 'rss', id: 'backup-fixture', name: marker, category: 'news', enabled: false, limit: 20,
+          url: 'https://example.com/feed.xml', createdAt: '2026-01-01T00:00:00.000Z', updatedAt: '2026-01-01T00:00:00.000Z',
+        }))
+      }
     }
   }
   db.prepare('INSERT INTO units (name, version) VALUES (?, ?)').run('prismflow_content', 1)
@@ -283,7 +293,8 @@ test('dashboard exports Follow and other operator configuration while preserving
     await mkdir(profile, { recursive: true }); await mkdir(storage, { recursive: true })
     await writeFile(join(profile, 'package.json'), '{}\n'); await writeFile(join(profile, 'cordis.patch.yml'), '- id: prismflow-store-source-settings\n  disabled: false\n  config:\n    credentialSlots:\n      - id: follow-cookie\n        name: Follow Cookie\n        usage: follow-cookie\n        credentialRef: PRISMFLOW_FOLLOW_COOKIE\n        allowDashboardWrite: true\n- id: prismflow-generator-subagent\n  disabled: false\n  config:\n    generators:\n      - id: daily-brief\n        name: Daily Brief\n        instruction: Write a daily brief.\n        persona: You are an editor.\n- id: prismflow-publisher-github-markdown\n  disabled: false\n  config:\n    destinations:\n      - id: archive\n        name: GitHub Archive\n        repository: owner/repository\n        tokenCredential: GITHUB_TOKEN\n')
     const databasePath = join(storage, 'domain.sqlite'); createBackupDatabase(databasePath, 'exported')
-    const maintenanceService = { async beginMaintenanceDrain() {}, maintenanceStatus() { return { active: 0, restartAllowed: true } } }
+    let maintenanceCalls = 0
+    const maintenanceService = { async beginMaintenanceDrain() { maintenanceCalls += 1 }, maintenanceStatus() { return { active: 0, restartAllowed: true } } }
     const credentialValues = new Map([['GITHUB_TOKEN', 'github-token-secret'], ['PRISMFLOW_FOLLOW_COOKIE', 'follow-cookie-secret'], ['OPENAI_IMAGE_API_KEY', 'image-api-secret']])
     const credentials = { async resolve(ref) { const value = credentialValues.get(ref); return value === undefined ? undefined : { value, source: 'file' } }, async describe() { return { configured: true, writable: true, source: 'file' } }, async set(ref, value) { credentialValues.set(ref, value) }, async unset(ref) { credentialValues.delete(ref) } }
     app = await dashboard({ prismPublishers: maintenanceService, prismProduction: maintenanceService, credentials }, '127.0.0.1', '127.0.0.1', { dshHome: home, profileName: 'web' })
@@ -299,12 +310,24 @@ test('dashboard exports Follow and other operator configuration while preserving
     assert.equal(parsed.payload.publisherRows[1].disabled, false); assert.equal(parsed.payload.publisherRows[1].config.destinations[0].repository, 'owner/repository')
     assert.equal(parsed.payload.units.some(unit => unit.name === 'prismflow_content'), false)
     assert.equal(Number(exported.headers.get('x-prismflow-record-count')), parsed.recordCount)
-    assert.equal(Number(exported.headers.get('x-prismflow-workflow-history-count')), 1); assert.equal(Number(exported.headers.get('x-prismflow-workflow-id-count')), 0)
+    assert.equal(Number(exported.headers.get('x-prismflow-workflow-history-count')), 0); assert.equal(Number(exported.headers.get('x-prismflow-workflow-id-count')), 0)
     assert.equal(Number(exported.headers.get('x-prismflow-profile-generator-count')), 1)
     assert.equal(Number(exported.headers.get('x-prismflow-workflow-historical-id-count')), 0); assert.equal(Number(exported.headers.get('x-prismflow-deleted-workflow-id-count')), 0)
     assert.equal(exported.headers.get('x-prismflow-fingerprint'), parsed.fingerprint)
     assert.deepEqual(parsed.payload.credentials, [{ ref: 'GITHUB_TOKEN', value: 'github-token-secret' }, { ref: 'OPENAI_IMAGE_API_KEY', value: 'image-api-secret' }, { ref: 'PRISMFLOW_FOLLOW_COOKIE', value: 'follow-cookie-secret' }])
     assert.equal((await request(app.origin, '/configuration-backup/import', { password: 'wrong password value', document: JSON.parse(exported.body) })).status, 400)
+
+    const invalidPayload = structuredClone(parsed.payload)
+    invalidPayload.units.find(unit => unit.name === 'prismflow_generator_workflows').tables[0].records = [
+      { key: 'broken:0000000001', value: JSON.stringify({ persona: 'DO_NOT_LEAK_BACKUP_PERSONA' }) },
+    ]
+    const invalidDocument = { ...invalidPayload, fingerprint: createHash('sha256').update(JSON.stringify(invalidPayload)).digest('hex') }
+    const invalidEnvelope = encryptPrismFlowDataBackup(gzipSync(Buffer.from(JSON.stringify(invalidDocument))), password)
+    const refused = await request(app.origin, '/configuration-backup/import', { password, document: JSON.parse(invalidEnvelope) })
+    assert.equal(refused.status, 400)
+    assert.equal(refused.value.unit, 'prismflow_generator_workflows')
+    assert.equal(JSON.stringify(refused.value).includes('DO_NOT_LEAK_BACKUP_PERSONA'), false)
+    assert.equal(maintenanceCalls, 0, 'bad history must fail before maintenance and Credential mutation')
 
     credentialValues.set('PRISMFLOW_FOLLOW_COOKIE', 'changed-cookie'); credentialValues.delete('OPENAI_IMAGE_API_KEY'); credentialValues.set('GITHUB_TOKEN', 'changed-github-token')
     const db = new DatabaseSync(databasePath)
@@ -314,12 +337,12 @@ test('dashboard exports Follow and other operator configuration while preserving
     const restored = await request(app.origin, '/configuration-backup/import', { password, document: JSON.parse(exported.body) })
     assert.equal(restored.status, 200); assert.equal(restored.value.restored, true); assert.equal(restored.value.restartRequired, true)
     assert.equal(restored.value.recordCount, parsed.recordCount); assert.equal(restored.value.credentialCount, 3); assert.equal(restored.value.profileGeneratorCount, 1); assert.equal(restored.value.publisherDestinationCount, 1); assert.equal(restored.value.maintenance, true)
-    assert.equal(restored.value.workflowHistoryCount, 1); assert.equal(restored.value.workflowIdCount, 0)
+    assert.equal(restored.value.workflowHistoryCount, 0); assert.equal(restored.value.workflowIdCount, 0)
     assert.equal(restored.value.workflowHistoricalIdCount, 0); assert.equal(restored.value.deletedWorkflowIdCount, 0)
     assert.equal(credentialValues.get('PRISMFLOW_FOLLOW_COOKIE'), 'follow-cookie-secret'); assert.equal(credentialValues.get('OPENAI_IMAGE_API_KEY'), 'image-api-secret'); assert.equal(credentialValues.get('GITHUB_TOKEN'), 'github-token-secret')
     assert.equal(YAML.parse(await readFile(join(profile, 'cordis.patch.yml'), 'utf8')).find(row => row.id === 'prismflow-publisher-github-markdown').config.destinations[0].repository, 'owner/repository')
     const verified = new DatabaseSync(databasePath, { readOnly: true })
-    assert.deepEqual(JSON.parse(verified.prepare('SELECT value FROM u_prismflow_source_settings_sources').get().value), { marker: 'exported' })
+    assert.equal(JSON.parse(verified.prepare('SELECT value FROM u_prismflow_source_settings_sources').get().value).name, 'exported')
     assert.deepEqual(JSON.parse(verified.prepare('SELECT value FROM u_prismflow_content_items').get().value), { marker: 'changed-fetched-content' })
     verified.close()
   } finally { if (app) await app.close(); await rm(home, { recursive: true, force: true }) }
@@ -355,9 +378,11 @@ test('dashboard toolset API projects trusted plugin Manifests and accepts plugin
     const body = { mode: 'custom', enabledPlugins: ['prismflow-system-sources'], enabledTools: ['prismflow_sources'], enabledSkills: [], expected: { version: 4, sha256: 'a'.repeat(64) } }
     const saved = await request(app.origin, '/toolsets', body)
     assert.equal(saved.status, 200); assert.deepEqual(savedInput, body); assert.equal(saved.value.toolset.version, 5)
+    assert.equal(saved.value.restartRequired, false); assert.equal(saved.value.runtimeApplied, true)
     const zip = new AdmZip(); zip.addFile('prismflow-plugin.json', Buffer.from(JSON.stringify({ format: 'prismflow-personal-plugin/v1', pluginId: 'prismflow-personal-upload', name: 'Upload', description: 'Uploaded', version: '1.0.0', entry: 'index.mjs', tools: ['prismflow_upload'] }))); zip.addFile('index.mjs', Buffer.from('export default () => {}'))
     const uploaded = await requestZip(app.origin, '/toolsets/plugin/import-zip', zip.toBuffer())
     assert.equal(uploaded.status, 201); assert.equal(uploaded.value.plugin.uploaded, true); assert.equal(JSON.stringify(uploaded.value).includes('SECRET'), false)
+    assert.equal(uploaded.value.restartRequired, false); assert.equal(uploaded.value.activationRequired, true)
     const removed = await request(app.origin, '/toolsets/plugin/delete', { pluginId: 'prismflow-personal-upload', expected: { version: 4, sha256: 'a'.repeat(64) } })
     assert.equal(removed.status, 200); assert.equal(removed.value.deleted.pluginId, 'prismflow-personal-upload'); assert.equal(removed.value.restartRequired, false)
   } finally { await app.close() }
@@ -650,7 +675,124 @@ test('dashboard media proxy admits only exact persisted draft media and returns 
   } finally { await app.close() }
 })
 
-test('every Dashboard API request requires a literal loopback Host on the listener port even without Origin', async () => {
+test('one corrupt imported history cannot fail the entire status endpoint or hide healthy services', async () => {
+  const configured = services()
+  configured.prismGeneratorWorkflows.list = () => { throw new Error('DO_NOT_LEAK_WORKFLOW_HISTORY') }
+  configured.prismToolsets = { getToolset() { throw new Error('DO_NOT_LEAK_TOOLSET_STATE') } }
+  const app = await dashboard(configured)
+  try {
+    const result = await request(app.origin, '/status')
+    assert.equal(result.status, 200)
+    assert.equal(result.value.services.sources, true)
+    assert.equal(result.value.services.production, true)
+    assert.equal(result.value.services.generatorWorkflows, false)
+    assert.equal(result.value.services.toolsets, false)
+    assert.equal(result.value.serviceDiagnostics.generatorWorkflows.state, 'data-invalid')
+    assert.equal(result.value.serviceDiagnostics.toolsets.state, 'data-invalid')
+    assert.equal(JSON.stringify(result.value).includes('DO_NOT_LEAK'), false)
+  } finally { await app.close() }
+})
+
+test('status remains readable when the three writable stores failed and projects only safe lock diagnostics', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'prismflow-ui-service-diagnostics-'))
+  const profile = join(home, 'profiles', 'web'); const locks = join(home, 'locks')
+  await mkdir(profile, { recursive: true }); await mkdir(locks)
+  await writeFile(join(profile, 'package.json'), '{}\n')
+  const lockPath = join(locks, 'toolsets.lock')
+  await writeFile(lockPath, JSON.stringify({ hostname: 'FOREIGN_LOCK_OWNER_FIXTURE', pid: process.pid,
+    nonce: '11111111-1111-4111-8111-111111111111', createdAt: '2020-01-01T00:00:00.000Z' }))
+  await writeFile(join(profile, 'cordis.patch.yml'), JSON.stringify([
+    { id: 'prismflow-store-toolsets', config: { writerLockPath: lockPath, secret: 'DO_NOT_PROJECT_PROFILE_SECRET' } },
+    { id: 'prismflow-store-production', config: { writerLockPath: '' } },
+    { id: 'prismflow-store-generator-workflows', disabled: true },
+  ]))
+  let app
+  try {
+    app = await dashboard({}, '127.0.0.1', '127.0.0.1', { dshHome: home, profileName: 'web' })
+    const result = await request(app.origin, '/status')
+    assert.equal(result.status, 200)
+    assert.equal(result.value.services.toolsets, false)
+    assert.equal(result.value.serviceDiagnostics.toolsets.state, 'foreign-host')
+    assert.equal(result.value.serviceDiagnostics.production.state, 'unconfigured')
+    assert.equal(result.value.serviceDiagnostics.generatorWorkflows.state, 'disabled')
+    const json = JSON.stringify(result.value)
+    for (const forbidden of [home, 'FOREIGN_LOCK_OWNER_FIXTURE', '11111111-1111', 'DO_NOT_PROJECT_PROFILE_SECRET']) assert.equal(json.includes(forbidden), false)
+  } finally { await app?.close(); await rm(home, { recursive: true, force: true }) }
+})
+
+test('authenticated DSH admission supports a trusted public Host and proxy port without losing CSRF and login checks', async () => {
+  // Use DSH's real Host/Origin and owner-admission implementation. Only its
+  // credential verifier is stubbed; PrismFlow never parses browser cookies.
+  const connection = new HostConnectionService(new Context(), ['dsh.example'], {
+    isAuthenticated(req) { return req.headers.cookie === 'test-session=valid' },
+    authenticateApi() { return undefined },
+  })
+  const calls = []
+  const app = await dashboard({ ...services(), connection, prismContentStore: {
+    async deleteBatch(ids) { calls.push(ids); return { deletedIds: ids, missingIds: [], failedIds: [] } },
+  } })
+  const cookie = { cookie: 'test-session=valid' }
+  const body = { storeIds: ['a'.repeat(64)], confirm: true }
+  try {
+    assert.equal((await requestWithHost(app.origin, '/status', 'dsh.example:443')).status, 401)
+    assert.equal((await request(app.origin, '/status')).status, 401, 'loopback must not bypass active DSH auth')
+    assert.equal((await requestWithHost(app.origin, '/status', 'dsh.example:443', cookie)).status, 200)
+    assert.equal((await requestWithHost(app.origin, '/status', 'attacker.example:443', cookie)).status, 403)
+    assert.equal((await requestWithHost(app.origin, '/status', 'attacker.example:443', { ...cookie, 'x-forwarded-host': 'dsh.example', 'sec-fetch-site': 'same-origin' })).status, 403)
+    assert.equal((await requestWithHost(app.origin, '/status', 'dsh.example:443', { 'sec-fetch-site': 'same-origin' })).status, 401)
+    assert.equal((await requestWithHost(app.origin, '/content/delete', 'dsh.example:443', { ...cookie, origin: 'https://evil.example' }, body)).status, 403)
+    assert.equal((await requestWithHost(app.origin, '/content/delete', 'dsh.example:443', { ...cookie, origin: 'https://dsh.example', 'sec-fetch-site': 'cross-site' }, body)).status, 403)
+    assert.equal(calls.length, 0)
+    const saved = await requestWithHost(app.origin, '/content/delete', 'dsh.example', { ...cookie, origin: 'https://dsh.example' }, body)
+    assert.equal(saved.status, 200); assert.deepEqual(calls, [body.storeIds])
+    const health = await request(app.origin, '/health')
+    assert.equal(health.status, 200)
+    assert.deepEqual(health.value, { version: 1, pluginVersion: PACKAGE_VERSION, ready: true })
+    assert.equal((await requestWithHost(app.origin, '/health', 'dsh.example:443', cookie)).status, 403)
+  } finally { await app.close(); await (connection.browserPeer ?? connection.operator).dispose() }
+})
+
+test('DSH admission rejects non-owner and disposed Peers, malformed results and incompatible auth services without local fallback', async () => {
+  for (const connection of [
+    {}, { admit: () => undefined }, { admit: () => ({}) },
+    { admit: () => ({ peer: { principal: { kind: 'guest' }, signal: new AbortController().signal } }) },
+    { admit: () => ({ peer: { principal: { kind: 'owner' }, signal: AbortSignal.abort() } }) },
+  ]) {
+    const app = await dashboard({ ...services(), connection })
+    try {
+      assert.ok([403, 503].includes((await request(app.origin, '/status')).status))
+      assert.ok([403, 503].includes((await request(app.origin, '/content/delete', { storeIds: ['a'.repeat(64)], confirm: true })).status))
+    } finally { await app.close() }
+  }
+})
+
+test('a disappearing DSH Connection cannot downgrade an authenticated Dashboard to legacy local trust', async () => {
+  const configured = { ...services(), connection: { admit: () => ({ peer: { principal: { kind: 'owner' }, signal: new AbortController().signal } }) } }
+  const app = await dashboard(configured)
+  try {
+    assert.equal((await request(app.origin, '/status')).status, 200)
+    delete configured.connection
+    assert.equal((await request(app.origin, '/status')).status, 503)
+    assert.equal((await request(app.origin, '/health')).status, 200)
+  } finally { await app.close() }
+})
+
+test('authenticated DSH owners may reach the Dashboard over a non-loopback peer', async t => {
+  const address = Object.values(networkInterfaces()).flat().find(item => item?.family === 'IPv4' && !item.internal)?.address
+  if (!address) return t.skip('no non-loopback IPv4 interface is available')
+  const connection = new HostConnectionService(new Context(), [address], {
+    isAuthenticated(req) { return req.headers.cookie === 'test-session=valid' },
+    authenticateApi() { return undefined },
+  })
+  const app = await dashboard({ ...services(), connection }, '0.0.0.0', address)
+  try {
+    assert.equal((await request(app.origin, '/status')).status, 401)
+    assert.equal((await request(app.origin, '/status', undefined, { cookie: 'test-session=valid' })).status, 200)
+    assert.equal((await request(app.origin, '/health', undefined, { cookie: 'test-session=valid' })).status, 403)
+  } finally { await app.close(); await (connection.browserPeer ?? connection.operator).dispose() }
+})
+
+test('legacy Dashboard API requests require a literal loopback Host on the listener port even without Origin', async () => {
   const app = await dashboard(services())
   try {
     const port = new URL(app.origin).port

@@ -4,6 +4,8 @@ import AdmZip from 'adm-zip'
 import Schema from '@deepseek-ai/schemastery'
 import YAML from 'yaml'
 import { managedMediaFetch } from './secure-rss-fetch.js'
+import { prismFlowServiceDiagnostics } from './runtime-diagnostics.js'
+import { validateConfigurationStartup } from './configuration-startup-validation.js'
 import { createPrismFlowDataBackup, decryptPrismFlowDataBackup, encryptPrismFlowDataBackup, MAX_PRISMFLOW_BACKUP_BYTES, parsePrismFlowDataBackup, PrismFlowDataBackupError, readProfileGenerators, readSourceCredentialSlots, restorePrismFlowDataBackup } from './data-backup.js'
 import { publicationReconciliationResult } from './store-production.js'
 import { PRISMFLOW_CORE_TOOL_NAMES, PRISMFLOW_TOOL_NAMES } from './store-prismflow-toolsets.js'
@@ -111,6 +113,39 @@ function validateSameOrigin(req, authority, originRequired = false) {
     if (parsed.origin !== authority.origin || parsed.username || parsed.password) throw new Error('origin mismatch')
   } catch {
     throw new HttpError(403, 'Cross-origin requests are not allowed')
+  }
+}
+
+const authenticatedDashboardContexts = new WeakSet()
+
+/** Use DSH's authenticated owner admission when available; legacy hosts stay local-only. */
+function validateDashboardAccess(ctx, req, mutating) {
+  const connection = ctx.get?.('connection')
+  if (connection !== undefined && connection !== null) {
+    authenticatedDashboardContexts.add(ctx)
+    // An unavailable/incompatible auth provider must never fall back to the
+    // unauthenticated legacy boundary, even for a loopback peer.
+    if (typeof connection.admit !== 'function') throw new HttpError(503, 'DSH Dashboard authentication is unavailable')
+    const admission = connection.admit(req)
+    if (admission?.rejection === 401) throw new HttpError(401, 'Sign in through the DSH launch URL before opening PrismFlow')
+    const peer = admission?.peer
+    const owner = peer?.principal?.kind === 'owner' && peer.signal?.aborted === false
+    // DSH 0.2.0 exposes one authenticated operator, before named principals.
+    // Require its exact service-owned identity, never an arbitrary untyped Peer.
+    const legacyOperator = peer !== undefined && peer !== null && peer === connection.operator
+      && connection.browserPeer === undefined && peer.principal === undefined
+    if (admission?.rejection !== undefined || !(owner || legacyOperator)) throw new HttpError(403, 'DSH denied PrismFlow dashboard access')
+    return
+  }
+  if (authenticatedDashboardContexts.has(ctx)) throw new HttpError(503, 'DSH Dashboard authentication is unavailable')
+  validateLocalDashboardAccess(req, mutating)
+}
+
+function validateLocalDashboardAccess(req, mutating = false) {
+  const authority = validateLoopbackHost(req)
+  validateSameOrigin(req, authority, mutating)
+  if (!isLoopbackAddress(req.socket?.remoteAddress)) {
+    throw new HttpError(403, 'PrismFlow dashboard operations are restricted to the local machine')
   }
 }
 
@@ -575,6 +610,7 @@ function toolsetError(error) {
   if (error?.name === 'PrismToolsetValidationError') return new HttpError(400, error.message, { code: 'toolset_validation' })
   if (error?.name === 'PrismToolsetConflictError') return new HttpError(409, error.message, { code: 'toolset_conflict' })
   if (error?.name === 'PrismToolsetDeletedError') return new HttpError(410, error.message, { code: 'skill_deleted' })
+  if (error?.name === 'PrismToolsetRuntimeError') return new HttpError(409, error.message, { code: 'toolset_runtime' })
   return error
 }
 function projectPrismPlugin(record) {
@@ -582,7 +618,11 @@ function projectPrismPlugin(record) {
     origin: record?.origin === 'system' ? 'system' : 'personal', version: typeof record?.version === 'number' ? record.version : boundedString(record?.version, 64),
     configurable: record?.configurable === true, uploaded: record?.uploaded === true, removable: record?.removable === true,
     tools: Array.isArray(record?.tools) ? record.tools.filter(tool => typeof tool === 'string').slice(0, 16) : [],
-    skills: Array.isArray(record?.skills) ? record.skills.filter(skill => typeof skill === 'string').slice(0, 16) : [] }
+    skills: Array.isArray(record?.skills) ? record.skills.filter(skill => typeof skill === 'string').slice(0, 16) : [],
+    ...(['active', 'disabled', 'pending', 'error'].includes(record?.runtime?.state) ? { runtime: {
+      state: record.runtime.state,
+      registeredTools: Array.isArray(record.runtime.registeredTools) ? record.runtime.registeredTools.filter(tool => typeof tool === 'string' && record.tools?.includes(tool)).slice(0, 16) : [],
+    } } : {}) }
 }
 function projectPrismSkill(record, includeContent = false) {
   return { skillId: boundedString(record?.skillId, 96), name: boundedString(record?.name, 128), description: boundedString(record?.description, 500),
@@ -895,11 +935,13 @@ async function routeRequest(ctx, req, res, requestUrl, profileBinding) {
   const pathname = requestUrl.pathname
   const method = req.method ?? 'GET'
   const mutating = method === 'POST' || method === 'PUT'
-  const authority = validateLoopbackHost(req)
-  validateSameOrigin(req, authority, mutating)
-  if (!isLoopbackAddress(req.socket?.remoteAddress)) {
-    throw new HttpError(403, 'PrismFlow dashboard operations are restricted to the local machine')
+  if (method === 'GET' && pathname === `${API_PREFIX}/health`) {
+    // The offline updater has no browser session. Expose only package identity
+    // on the old strict loopback boundary, never configuration or store data.
+    validateLocalDashboardAccess(req)
+    return jsonResponse(res, 200, { version: 1, pluginVersion: PLUGIN_VERSION, ready: true })
   }
+  validateDashboardAccess(ctx, req, mutating)
 
   if (method === 'POST' && pathname === `${API_PREFIX}/configuration-backup/export`) {
     if (!profileBinding) throw new HttpError(409, 'Dashboard Profile binding is required for configuration backup')
@@ -932,9 +974,13 @@ async function routeRequest(ctx, req, res, requestUrl, profileBinding) {
     const body = await readJson(req, MAX_PRISMFLOW_BACKUP_BYTES * 2); allowFields(body, ['password', 'document'])
     const password = backupPassword(body.password)
     let buffer, parsed
-    try { buffer = decryptPrismFlowDataBackup(body.document, password); parsed = parsePrismFlowDataBackup(buffer) }
+    try {
+      buffer = decryptPrismFlowDataBackup(body.document, password)
+      parsed = parsePrismFlowDataBackup(buffer)
+      await validateConfigurationStartup(parsed, ctx.get('prismToolsets')?.listPlugins?.() ?? [])
+    }
     catch (error) {
-      if (error instanceof PrismFlowDataBackupError) throw new HttpError(400, error.message, { code: 'prismflow_data_backup_invalid' })
+      if (error instanceof PrismFlowDataBackupError) throw new HttpError(400, error.message, { code: 'prismflow_data_backup_invalid', ...(error.unit ? { unit: error.unit } : {}) })
       throw error
     }
     const maintenance = await drainForProfileApply(ctx)
@@ -963,32 +1009,43 @@ async function routeRequest(ctx, req, res, requestUrl, profileBinding) {
     const sourceSettings = ctx.get('prismSourceSettings')
     const generatorWorkflows = ctx.get('prismGeneratorWorkflows')
     const rssOutputs = ctx.get('prismRssOutputs')
-    const workflowRows = generatorWorkflows ? await generatorWorkflows.list() : []
+    const toolsets = ctx.get('prismToolsets')
+    const imageSettings = ctx.get('prismImageGenerationSettings')
+    const aiPrompts = ctx.get('prismAiPrompts')
+    const services = {
+      sources: sources !== undefined, sourceSettings: sourceSettings !== undefined, contentStore: contentStore !== undefined,
+      publishers: publishers !== undefined, receipts: receipts !== undefined, production: production !== undefined,
+      generatorWorkflows: generatorWorkflows !== undefined, toolsets: toolsets !== undefined,
+      imageGenerationSettings: imageSettings !== undefined, aiPrompts: aiPrompts !== undefined, rssOutputs: rssOutputs !== undefined,
+    }
+    const serviceDiagnostics = await prismFlowServiceDiagnostics(ctx, profileBinding)
+    const inspect = async (key, read, fallback) => {
+      try { return await read() }
+      catch {
+        // Imported history can fail a read even after the service registered.
+        // Do not turn one damaged table into a 500 for the entire Dashboard.
+        services[key] = false
+        serviceDiagnostics[key] = { state: 'data-invalid', message: '服务已注册，但配置或历史数据读取失败。请保留备份；其它服务不受此状态请求影响。' }
+        ctx.logger.warn(`prismflow status data read failed: ${key}`)
+        return fallback
+      }
+    }
+    const [sourceCount, sourceSettingsCount, contentCount, publisherCount, generatorCount, workflowCount, rssCount] = await Promise.all([
+      inspect('sources', async () => (await sources?.list())?.length ?? 0, 0),
+      inspect('sourceSettings', async () => (await sourceSettings?.list())?.length ?? 0, 0),
+      inspect('contentStore', () => contentStore?.count?.() ?? 0, 0),
+      inspect('publishers', async () => (await publishers?.list())?.length ?? 0, 0),
+      inspect('production', async () => (await production?.listGenerators())?.length ?? 0, 0),
+      inspect('generatorWorkflows', async () => (await generatorWorkflows?.list())?.length ?? 0, 0),
+      inspect('rssOutputs', async () => (await rssOutputs?.list({ limit: 100 }))?.length ?? 0, 0),
+      inspect('toolsets', () => toolsets?.getToolset?.(), undefined),
+      inspect('imageGenerationSettings', () => imageSettings?.get?.(), undefined),
+      inspect('aiPrompts', () => aiPrompts?.get?.(), undefined),
+    ])
     return jsonResponse(res, 200, {
-      version: 1,
-      pluginVersion: PLUGIN_VERSION,
-      services: {
-        sources: sources !== undefined,
-        sourceSettings: sourceSettings !== undefined,
-        contentStore: contentStore !== undefined,
-        publishers: publishers !== undefined,
-        receipts: receipts !== undefined,
-        production: production !== undefined,
-        generatorWorkflows: generatorWorkflows !== undefined,
-        toolsets: ctx.get('prismToolsets') !== undefined,
-        imageGenerationSettings: ctx.get('prismImageGenerationSettings') !== undefined,
-        aiPrompts: ctx.get('prismAiPrompts') !== undefined,
-        rssOutputs: rssOutputs !== undefined,
-      },
-      counts: {
-        sources: sources?.list().length ?? 0,
-        sourceSettings: sourceSettings?.list().length ?? 0,
-        contents: contentStore?.count?.() ?? 0,
-        publishers: publishers?.list().length ?? 0,
-        generators: production?.listGenerators().length ?? 0,
-        generatorWorkflows: workflowRows.length,
-        rssOutputs: rssOutputs?.list({ limit: 100 }).length ?? 0,
-      },
+      version: 1, pluginVersion: PLUGIN_VERSION, serviceDiagnostics, services,
+      counts: { sources: sourceCount, sourceSettings: sourceSettingsCount, contents: contentCount, publishers: publisherCount,
+        generators: generatorCount, generatorWorkflows: workflowCount, rssOutputs: rssCount },
     })
   }
 
@@ -1251,7 +1308,7 @@ async function routeRequest(ctx, req, res, requestUrl, profileBinding) {
   }
   if (method === 'POST' && pathname === `${API_PREFIX}/toolsets/plugin/import-zip`) {
     const files = parsePersonalPluginZip(await readBinary(req, 'application/zip', 600 * 1024))
-    try { return jsonResponse(res, 201, { plugin: projectPrismPlugin(await requireService(ctx, 'prismToolsets', 'PrismFlow Toolset').installPersonalPlugin(files)), restartRequired: true }) }
+    try { return jsonResponse(res, 201, { plugin: projectPrismPlugin(await requireService(ctx, 'prismToolsets', 'PrismFlow Toolset').installPersonalPlugin(files)), restartRequired: false, activationRequired: true }) }
     catch (error) { throw toolsetError(error) }
   }
   if (method === 'POST' && pathname === `${API_PREFIX}/toolsets/plugin/delete`) {
@@ -1271,7 +1328,7 @@ async function routeRequest(ctx, req, res, requestUrl, profileBinding) {
   }
   if (method === 'POST' && pathname === `${API_PREFIX}/toolsets`) {
     const body = await readJson(req); allowFields(body, ['mode', 'enabledPlugins', 'enabledTools', 'enabledSkills', 'expected'])
-    try { return jsonResponse(res, 200, { toolset: projectPrismToolset(await requireService(ctx, 'prismToolsets', 'PrismFlow Toolset').saveToolset(body)), restartRequired: true }) }
+    try { return jsonResponse(res, 200, { toolset: projectPrismToolset(await requireService(ctx, 'prismToolsets', 'PrismFlow Toolset').saveToolset(body)), restartRequired: false, runtimeApplied: true }) }
     catch (error) { throw toolsetError(error) }
   }
   if (method === 'POST' && pathname === `${API_PREFIX}/toolsets/skill/import-zip`) {

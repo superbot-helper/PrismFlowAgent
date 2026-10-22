@@ -602,7 +602,7 @@
     ]
     const publisherChannelDefinitions = [
       { kind: 'local-markdown', rowId: 'prismflow-publisher-local-markdown', label: '本地 Markdown 存储', group: 'artifact', nativeAddition: true, nativeNote: '将批准的 Markdown Artifact 原子写入部署固定的本地目录，适合归档和后续站点构建。', fields: [
-        ['id', '目标 ID'], ['name', '显示名称'], ['root', 'Local 根目录'], ['artifactFileNamePattern', 'Artifact 文件名模式'], ['overwrite', '覆盖策略', overwriteOptions],
+        ['id', '目标 ID'], ['name', '显示名称'], ['root', 'Local 根目录', 'text', { help: '填写 DSH 运行环境中已存在的绝对目录。保存并按提示应用后仅影响后续发布，不会自动搬迁旧文件。' }], ['artifactFileNamePattern', 'Artifact 文件名模式'], ['overwrite', '覆盖策略', overwriteOptions],
         ['maxBytes', '最大文件大小（Bytes）', 'number', { advanced: true, min: 1024, max: 2000000, help: '范围：1,024–2,000,000 Bytes' }],
       ] },
       { kind: 'github-markdown', rowId: 'prismflow-publisher-github-markdown', label: 'GitHub Archive', group: 'publish', fields: [
@@ -1116,26 +1116,54 @@
       ] : []
 
       async function loadPrismToolset() {
+        const serviceStatus = status
         const value = await run('toolsets:load', async signal => {
-          const [toolsets, image, prompts, aiPrompts] = await Promise.all([
-            api('/toolsets', { signal }),
-            status?.services.imageGenerationSettings ? api('/image-generation/settings', { signal }) : Promise.resolve(null),
-            api('/prompt-suggestions', { signal }),
-            status?.services.aiPrompts ? api('/ai-prompts/settings', { signal }) : Promise.resolve(null),
-          ])
-          return { toolsets, image, prompts, aiPrompts }
+          // Publish the core catalog without waiting for optional settings. A
+          // failed/slow FFmpeg or prompt card must not hide the whole toolset.
+          const core = api('/toolsets', { signal }).then(toolsets => {
+            if (!signal.aborted) {
+              setPrismToolset(toolsets.toolset)
+              setPrismPlugins(toolsets.plugins || [])
+              setPrismSkills(toolsets.skills || [])
+            }
+            return toolsets
+          })
+          const sections = [
+            ['image', '媒体与图片设置', serviceStatus?.services.imageGenerationSettings ? api('/image-generation/settings', { signal }) : Promise.resolve(null)],
+            ['prompts', '候选输入文案', api('/prompt-suggestions', { signal })],
+            ['aiPrompts', 'AI 提示词设置', serviceStatus?.services.aiPrompts ? api('/ai-prompts/settings', { signal }) : Promise.resolve(null)],
+          ]
+          const [toolsets, results] = await Promise.all([core, Promise.allSettled(sections.map(section => section[2]))])
+          if (signal.aborted) return undefined
+          const loaded = { toolsets, warnings: [] }
+          results.forEach((result, index) => {
+            const [key, label] = sections[index]
+            loaded[key] = result.status === 'fulfilled' ? result.value : null
+            if (result.status === 'rejected') loaded.warnings.push(label)
+          })
+          return loaded
         })
         if (value) {
           setPrismToolset(value.toolsets.toolset)
           setPrismPlugins(value.toolsets.plugins || [])
           setPrismSkills(value.toolsets.skills || [])
           setPromptSuggestions(value.prompts?.suggestions ?? null)
-          if (value.aiPrompts) setAiPromptSettings(value.aiPrompts.settings)
+          setAiPromptSettings(value.aiPrompts?.settings ?? null)
           if (value.image) {
             setImageGenerationSettings({ ...value.image.settings, avifQuality: String(value.image.settings.avifQuality), avifEffort: String(value.image.settings.avifEffort) })
             setImageGenerationCredential(value.image.credential); setImageGenerationCredentialValue(''); setFfmpegStatus(value.image.ffmpeg ?? null)
+          } else {
+            setImageGenerationSettings(null); setImageGenerationCredential(null); setImageGenerationCredentialValue(''); setFfmpegStatus(null)
           }
+          if (value.warnings.length) setNotice({ type: 'error', text: `工具集已加载；以下独立设置加载失败：${value.warnings.join('、')}。可重试加载，不影响插件与 Skill 列表。` })
         }
+      }
+      async function retryPrismToolset() {
+        const latest = await run('toolsets:probe', signal => api('/status', { signal }))
+        if (!latest) return
+        setStatus(latest)
+        // A false -> true transition is loaded by the service-status effect.
+        if (status?.services.toolsets && latest.services.toolsets) await loadPrismToolset()
       }
       function editAiPromptSetting(field, value) { setAiPromptSettings(current => ({ ...current, [field]: value })) }
       async function saveAiPromptSettings() {
@@ -1192,7 +1220,7 @@
       }) }
       function toggleSkill(name) { setPrismToolset(current => ({ ...current, enabledSkills: current.enabledSkills.includes(name) ? current.enabledSkills.filter(item => item !== name) : [...current.enabledSkills, name] })) }
       async function savePrismToolset() {
-        const value = await run('toolsets:save', signal => api('/toolsets', { method: 'POST', body: { mode: prismToolset.mode, enabledPlugins: prismToolset.enabledPlugins, enabledTools: prismToolset.enabledTools, enabledSkills: prismToolset.enabledSkills, expected: { version: prismToolset.version, sha256: prismToolset.sha256 } }, signal }), '插件与 Skill 配置已保存；Skill 选择立即生效，插件与工具变更在重启 DSH 后完整生效。')
+        const value = await run('toolsets:save', signal => api('/toolsets', { method: 'POST', body: { mode: prismToolset.mode, enabledPlugins: prismToolset.enabledPlugins, enabledTools: prismToolset.enabledTools, enabledSkills: prismToolset.enabledSkills, expected: { version: prismToolset.version, sha256: prismToolset.sha256 } }, signal }), '插件与 Skill 配置已保存并应用：启用工具已注册，停用工具已注销；无需重启 DSH。' )
         if (value) { setPrismToolset(value.toolset); await loadPrismToolset() }
       }
       function updatePromptSuggestion(id, patch) { setPromptSuggestions(current => ({ ...current, items: current.items.map(item => item.id === id ? { ...item, ...patch } : item) })) }
@@ -1268,7 +1296,7 @@
         input.onchange = async () => {
           const file = input.files?.[0]; if (!file) return
           if (file.size > 600 * 1024) { setNotice({ type: 'error', text: '个人插件 ZIP 超过 600 KiB 请求上限。' }); return }
-          const value = await run('plugin:zip', signal => api('/toolsets/plugin/import-zip', { method: 'POST', rawBody: file, contentType: 'application/zip', signal }), '个人插件已安装；重启 DSH 后“全部启用”模式会自动启用，其他模式需手动启用并再次重启。')
+          const value = await run('plugin:zip', signal => api('/toolsets/plugin/import-zip', { method: 'POST', rawBody: file, contentType: 'application/zip', signal }), '个人插件已安装；请保存插件配置以应用启用状态。启用后即时注册工具，无需重启 DSH。')
           if (value) await loadPrismToolset()
         }
         input.click()
@@ -1318,7 +1346,17 @@
         if (value) { if (prismSkillEditor?.skillId === skill.skillId) { setPrismSkillEditor(null); setPrismSkillHistory([]) } await loadPrismToolset() }
       }
       function toolsetsView() {
-        if (!status?.services.toolsets || !prismToolset) return h(Empty, null, 'PrismFlow 工具集服务当前不可用。')
+        if (!status?.services.toolsets || !prismToolset) {
+          const loading = status === null || busy === 'toolsets:load' || busy === 'toolsets:probe'
+          const unavailable = status !== null && !status.services.toolsets
+          const diagnostic = status?.serviceDiagnostics?.toolsets
+          return h('section', { className: 'pf-card pf-toolset-page', 'aria-busy': loading },
+            h('h2', { className: 'pf-section-title' }, loading ? '正在加载工具集…' : unavailable ? '工具集存储服务未启动' : '工具集接口加载未完成'),
+            h('p', null, unavailable ? 'PrismFlow 工具集服务当前不可用。配置不会被清空；可以查看诊断、重新检测，或尝试导出现有配置。' : '等待状态与工具集接口返回；若请求失败，请查看上方具体错误后重试。'),
+            diagnostic ? h('p', { role: 'status' }, diagnostic.message) : null,
+            h('div', { className: 'pf-actions' }, h(Button, { onClick: retryPrismToolset, disabled: !!busy }, '重新检测并加载'),
+              h(Button, { onClick: exportPrismFlowData, disabled: !!busy }, '导出全部配置')))
+        }
         const updateEditor = (field, value) => setPrismSkillEditor(current => ({ ...current, [field]: value }))
         const plugins = [...prismPlugins].sort((left, right) => {
           const originOrder = Number(left.origin !== 'system') - Number(right.origin !== 'system')
@@ -1328,16 +1366,18 @@
         const pluginCards = origin => plugins.filter(plugin => plugin.origin === origin).map(plugin => {
           const enabled = prismToolset.enabledPlugins.includes(plugin.pluginId)
           const enabledToolCount = plugin.tools.filter(tool => prismToolset.enabledTools.includes(tool)).length
+          const toggleLabel = plugin.runtime?.state === 'error' ? '运行时异常：请重新应用或检查依赖' : plugin.runtime?.state === 'pending' && enabled ? '配置已启用，等待工具注册' : plugin.runtime?.state === 'disabled' && enabled ? '待启用：保存后注册' : plugin.runtime?.state === 'active' && !enabled ? '待停用：保存后注销' : enabled ? '插件已启用' : '插件已停用'
           return h('article', { className: `pf-plugin-card${enabled ? ' pf-plugin-card-enabled' : ''}`, key: plugin.pluginId },
             h('div', { className: 'pf-plugin-card-head' },
               h('div', null, h('strong', null, plugin.name), h('span', { className: 'pf-code pf-plugin-id' }, plugin.pluginId)),
               h('span', { className: `pf-badge pf-origin-badge ${origin === 'system' ? 'pf-origin-system' : 'pf-origin-custom'}` }, origin === 'system' ? '系统插件' : plugin.uploaded ? '个人上传' : '个人插件')),
             h('p', { className: 'pf-plugin-description' }, plugin.description),
-            h('div', { className: 'pf-plugin-summary' }, h('span', null, `Manifest ${plugin.version}`), h('span', null, `${enabledToolCount} / ${plugin.tools.length} 个工具`)),
-            h('label', { className: 'pf-plugin-toggle' }, h('input', { type: 'checkbox', checked: enabled, disabled: prismToolset.mode !== 'custom', onChange: () => togglePlugin(plugin) }), enabled ? '插件已启用' : '插件已停用'),
+            h('div', { className: 'pf-plugin-summary' }, h('span', null, `Manifest ${plugin.version}`), h('span', null, `${enabledToolCount} / ${plugin.tools.length} 个工具`),
+              plugin.runtime ? h('span', { role: 'status' }, plugin.runtime.state === 'error' ? '运行时异常：工具调用已阻止' : `运行时已注册 ${plugin.runtime.registeredTools?.length ?? 0} 个工具`) : null),
+            h('label', { className: 'pf-plugin-toggle' }, h('input', { type: 'checkbox', checked: enabled, disabled: !!busy || prismToolset.mode !== 'custom', onChange: () => togglePlugin(plugin) }), toggleLabel),
             h('details', { className: 'pf-plugin-tools' }, h('summary', null, '查看工具'),
               h('div', { className: 'pf-plugin-tool-list' }, plugin.tools.map(tool => h('label', { className: 'pf-tool-option', key: tool },
-                h('input', { type: 'checkbox', checked: prismToolset.enabledTools.includes(tool), disabled: prismToolset.mode !== 'custom' || !enabled, onChange: () => togglePluginTool(plugin, tool) }), h('span', { className: 'pf-code' }, tool))))),
+                h('input', { type: 'checkbox', checked: prismToolset.enabledTools.includes(tool), disabled: !!busy || prismToolset.mode !== 'custom' || !enabled, onChange: () => togglePluginTool(plugin, tool) }), h('span', { className: 'pf-code' }, tool))))),
             plugin.removable ? h('div', { className: 'pf-plugin-management' },
               h('span', null, enabled ? '删除时自动停用工具、保存配置并移除 Bundle' : plugin.uploaded ? '删除上传的代码与资源' : '永久删除当前 Profile 中的个人插件 Bundle'),
               h(Button, { danger: true, onClick: () => deletePersonalPlugin(plugin), disabled: !!busy }, '删除插件')) : null)
@@ -1477,7 +1517,7 @@
                 h('div', { className: 'pf-toolset-header-actions' }, h(Button, { onClick: importPrismSkillZip, disabled: !!busy }, '上传 Skill ZIP'), h(Button, { onClick: newPrismSkill }, '手动新增 Skill'))),
               h('div', { className: 'pf-toolset-section-body' }, h('div', { className: 'pf-toolset-grid' }, skillCards))),
             editorPanel),
-          h('div', { className: 'pf-publisher-save-footer pf-publisher-changebar' }, h('div', { className: 'pf-publisher-change-copy' }, h('strong', null, `插件与 Skill 配置修订 ${prismToolset.version}`), h('span', null, 'Skill 变更即时进入后续目录；插件和工具变更需重启 DSH。')), h('div', { className: 'pf-actions' }, h(Button, { onClick: loadPrismToolset }, '放弃修改'), h(Button, { primary: true, onClick: savePrismToolset, disabled: !!busy }, '保存插件与 Skill 配置'))))
+          h('div', { className: 'pf-publisher-save-footer pf-publisher-changebar' }, h('div', { className: 'pf-publisher-change-copy' }, h('strong', null, `插件与 Skill 配置修订 ${prismToolset.version}`), h('span', null, '保存后即时注册或注销工具；Skill 选择即时生效，无需重启 DSH。')), h('div', { className: 'pf-actions' }, h(Button, { onClick: loadPrismToolset }, '放弃修改'), h(Button, { primary: true, onClick: savePrismToolset, disabled: !!busy }, '保存插件与 Skill 配置'))))
       }
 
       function overviewView() {
@@ -2055,7 +2095,10 @@
               h(Button, { danger: true, onClick: commitWorkflowDelete, disabled: !ready }, dialog.submitting ? '正在永久删除…' : '永久删除生成器'))))
       }
       function workflowBuilderView() {
-        if (!status?.services.generatorWorkflows) return h(Empty, null, '工作流生成器未启用。旧版提示词历史仅作为后端只读数据保留，不提供 Dashboard 编辑入口。请由部署者启用 prismflow-store-generator-workflows 与 Builder Profile 后再迁移。')
+        if (!status?.services.generatorWorkflows) return h('section', { className: 'pf-card' },
+          h('h2', { className: 'pf-section-title' }, status === null ? '正在读取工作流状态…' : '工作流存储服务未就绪'),
+          h('p', null, status?.serviceDiagnostics?.generatorWorkflows?.message ?? '工作流生成器未启用。旧版提示词历史仅作为后端只读数据保留，不提供 Dashboard 编辑入口。请由部署者启用 prismflow-store-generator-workflows 与 Builder Profile 后再迁移。'),
+          h(Button, { onClick: refreshOverview, disabled: !!busy }, '重新检测状态'))
         const editor = historicalWorkflow ?? workflowEditor
         const activeIndex = editor ? Math.max(0, editor.steps.findIndex(step => step.id === activeWorkflowStepId)) : -1
         const activeStep = activeIndex >= 0 ? editor.steps[activeIndex] : null
@@ -2467,7 +2510,10 @@
                 h(Button, { onClick: closePresentationOriginalPreview }, '返回图片列表')))) : null)
       }
       function reviewView() {
-        if (!status?.services.production) return h(Empty, null, '草稿生产服务未启用。数据获取和内容生成请在 DSH Chat 中执行。')
+        if (!status?.services.production) return h('section', { className: 'pf-card' },
+          h('h2', { className: 'pf-section-title' }, status === null ? '正在读取草稿生产状态…' : '草稿生产服务未就绪'),
+          h('p', null, status?.serviceDiagnostics?.production?.message ?? '草稿生产服务未启用。数据获取和内容生成请在 DSH Chat 中执行。'),
+          h(Button, { onClick: refreshOverview, disabled: !!busy }, '重新检测状态'))
         const statusCounts = draftPage.statusCounts ?? {}
         const reviewSummary = [
           ['', '全部', Object.values(statusCounts).reduce((sum, value) => sum + Number(value || 0), 0)],
@@ -2939,7 +2985,7 @@
         const baselineIds = new Set(publisherProfileBaseline.flatMap(row => row.config.destinations.map(destination => `${row.rowId}:${destination.id}`)))
         function renderDestinationField(row, destination, immutable, field) {
           const [path, label, mode, metadata = {}] = field
-          const mutableExistingField = path === 'name' || (row.channelKind === 'wechat-draft' && ['apiOrigin', 'allowInsecureHttp', 'ffmpegPath'].includes(path))
+          const mutableExistingField = path === 'name' || (row.channelKind === 'local-markdown' && path === 'root') || (row.channelKind === 'wechat-draft' && ['apiOrigin', 'allowInsecureHttp', 'ffmpegPath'].includes(path))
           const disabled = metadata.locked === true || (immutable && !mutableExistingField)
           if (mode === 'switch') return h(Switch, { key: path, label, checked: nestedValue(destination, path) === 1, disabled,
             onChange: checked => updatePublisherDestination(row.rowId, destination.id, path, checked ? '1' : '0', true) })
@@ -3113,7 +3159,7 @@
         }
         function renderManagerField(row, destination, immutable, field) {
           const [path, label, mode, metadata = {}] = field
-          const mutableExistingField = path === 'name' || (row.channelKind === 'wechat-draft' && ['apiOrigin', 'allowInsecureHttp', 'ffmpegPath'].includes(path))
+          const mutableExistingField = path === 'name' || (row.channelKind === 'local-markdown' && path === 'root') || (row.channelKind === 'wechat-draft' && ['apiOrigin', 'allowInsecureHttp', 'ffmpegPath'].includes(path))
           const disabled = metadata.locked === true || (immutable && !mutableExistingField)
           if (mode === 'switch') return h(Switch, { key: path, label, checked: nestedValue(destination, path) === 1, disabled,
             onChange: checked => updatePublisherDestination(row.rowId, destination.id, path, checked ? '1' : '0', true) })

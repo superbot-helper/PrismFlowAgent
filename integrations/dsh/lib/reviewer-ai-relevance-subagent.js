@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto'
+import { startPrismFlowSubagent } from './subagent-compat.js'
 import Schema from '@deepseek-ai/schemastery'
 
 export const name = 'prismflow-reviewer-ai-relevance-subagent'
@@ -303,7 +304,7 @@ export function apply(ctx, rawConfig) {
             const prompt = `${activeInstruction}${repair}\n\n${rules}\n<BEGIN_CONTENT_CARDS_JSON>\n${payload}\n<END_CONTENT_CARDS_JSON>\n${rules}`
             let result
             try {
-              const run = await ctx.subagents.start(config.subagentProvider, {
+              const run = await startPrismFlowSubagent(ctx, config.subagentProvider, {
                 label: attempt === 0 ? 'PrismFlow AI editorial scoring' : 'PrismFlow AI editorial format repair',
                 prompt: [{ type: 'text', text: prompt }], parent: execution.agent,
                 signal: controller.signal, outputSchema: OUTPUT_SCHEMA, persona: config.persona, toolFilter: { allow: [] },
@@ -375,7 +376,7 @@ export function apply(ctx, rawConfig) {
             const activeClusterInstruction = customPrompts?.clusterInstruction || config.clusterInstruction
             const prompt = `${activeClusterInstruction}${repair}\n\n${rules}\n<BEGIN_EVENT_CARDS_JSON>\n${batch.payload}\n<END_EVENT_CARDS_JSON>\n${rules}`
             try {
-              const run = await ctx.subagents.start(config.subagentProvider, {
+              const run = await startPrismFlowSubagent(ctx, config.subagentProvider, {
                 label: `PrismFlow AI event clustering ${index + 1}/${batches.length}`, prompt: [{ type: 'text', text: prompt }], parent: execution.agent,
                 signal: controller.signal, outputSchema: CLUSTER_OUTPUT_SCHEMA, persona: config.persona, toolFilter: { allow: [] },
               })

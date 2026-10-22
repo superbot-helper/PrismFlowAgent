@@ -321,6 +321,13 @@ function operational(destination, rowId, legacy = false) {
   }
   return canonicalJson(value)
 }
+function mutableLocalRoot(previous, next, rowId) {
+  if (rowId !== 'prismflow-publisher-local-markdown' || !previous || previous.root === next.root) return false
+  const before = JSON.parse(operational(previous, rowId)); const after = JSON.parse(operational(next, rowId))
+  delete before.root; delete after.root
+  return canonicalJson(before) === canonicalJson(after)
+}
+function localRootReservationKey(destinationId, digest) { return `@local-root:${destinationId}:${digest}` }
 function identityDigests(destination, rowId) {
   const current = sha256(operational(destination, rowId))
   const legacy = sha256(operational(destination, rowId, true))
@@ -371,14 +378,25 @@ function seedAndCheckState(state, parsed, changes) {
     for (const destination of raw.destinations) {
       const key = stateKey(descriptor.rowId, destination.id)
       const digests = identityDigests(destination, descriptor.rowId)
-      if (destinations[key] !== undefined && ![digests.current, digests.legacy].includes(destinations[key])) fail(`Destination id ${descriptor.rowId}:${destination.id} was previously used by a different immutable identity`)
+      if (destinations[key] !== undefined && ![digests.current, digests.legacy].includes(destinations[key])) {
+        // A root-only edit reserves state before replacing the Profile. Keep
+        // the old active root digest so an interrupted publication can resume.
+        const reservedActiveRoot = descriptor.kind === 'local-markdown'
+          && destinations[localRootReservationKey(destination.id, digests.current)] === digests.current
+        if (!reservedActiveRoot) fail(`Destination id ${descriptor.rowId}:${destination.id} was previously used by a different immutable identity`)
+        destinations[localRootReservationKey(destination.id, destinations[key])] = destinations[key]
+      }
       destinations[key] = digests.current
     }
   }
   for (const change of changes) for (const destination of change.config.destinations) {
     const key = stateKey(change.rowId, destination.id)
     const digests = identityDigests(destination, change.rowId)
-    if (destinations[key] !== undefined && ![digests.current, digests.legacy].includes(destinations[key])) fail(`Retired destination id ${change.rowId}:${destination.id} cannot be reused with a different identity`)
+    if (destinations[key] !== undefined && ![digests.current, digests.legacy].includes(destinations[key])) {
+      const previous = parsed.found.get(change.rowId)?.row.config.destinations.find(row => row.id === destination.id)
+      if (!mutableLocalRoot(previous, destination, change.rowId)) fail(`Retired destination id ${change.rowId}:${destination.id} cannot be reused with a different identity`)
+      destinations[localRootReservationKey(destination.id, destinations[key])] = destinations[key]
+    }
     destinations[key] = digests.current
   }
   if (Object.keys(destinations).length > MAX_STATE_DESTINATIONS) fail(`Publisher managed state cannot retain more than ${MAX_STATE_DESTINATIONS} destination tombstones; no ids were pruned`)
@@ -391,7 +409,7 @@ function enforceImmutableIdentity(oldConfig, nextConfig, rowId) {
   const oldById = new Map(oldConfig.destinations.map(destination => [destination.id, destination]))
   for (const destination of nextConfig.destinations) {
     const previous = oldById.get(destination.id)
-    if (previous && operational(previous, rowId) !== operational(destination, rowId)) fail(`Operational changes for ${rowId}:${destination.id} require a new immutable destination id and retirement of the old id`)
+    if (previous && operational(previous, rowId) !== operational(destination, rowId) && !mutableLocalRoot(previous, destination, rowId)) fail(`Operational changes for ${rowId}:${destination.id} require a new immutable destination id and retirement of the old id`)
   }
 }
 

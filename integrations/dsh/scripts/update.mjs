@@ -182,10 +182,10 @@ async function waitForHealth(port) {
   let lastError = 'not started'
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/prismflow/status`, { signal: AbortSignal.timeout(2_000) })
+      const response = await fetch(`http://127.0.0.1:${port}/api/prismflow/health`, { signal: AbortSignal.timeout(2_000) })
       if (response.ok) {
         const value = await response.json()
-        if (value && typeof value === 'object') {
+        if (value && typeof value === 'object' && value.version === 1 && value.ready === true && typeof value.pluginVersion === 'string') {
           healthySince ||= Date.now()
           healthyValue = value
           if (Date.now() - healthySince >= HEALTH_STABILITY_MS) return healthyValue

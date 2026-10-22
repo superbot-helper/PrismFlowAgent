@@ -1,4 +1,5 @@
 import Schema from '@deepseek-ai/schemastery'
+import { startPrismFlowSubagent } from './subagent-compat.js'
 import {
   buildAISearchPrompt,
   normalizeAISearchItems,
@@ -104,7 +105,7 @@ export function apply(ctx, config) {
         const limit = Math.min(requestedLimit, source.limit)
         const prompt = buildAISearchPrompt(source.keyword, limit)
 
-        const run = await ctx.subagents.start(source.subagentProvider, {
+        const run = await startPrismFlowSubagent(ctx, source.subagentProvider, {
           label: `search ${source.id}`,
           prompt: [{ type: 'text', text: prompt }],
           parent: execution.agent,

@@ -1,4 +1,5 @@
 import { isIP } from 'node:net'
+import { startPrismFlowSubagent } from './subagent-compat.js'
 import Schema from '@deepseek-ai/schemastery'
 import { Service } from '@deepseek-ai/cordis'
 import { defineDomain, domainTable } from '@deepseek-ai/dsh-storage-domain'
@@ -562,7 +563,7 @@ export class PrismSourceSettings extends Service {
     return { id: record.settingsId, name: record.name, description: `Research current information for the managed keyword: ${record.keyword}.`, requiresAgent: true, fetch: async (request, execution) => {
       if (!execution.agent) throw new Error('AI Search requires a model-driven DSH tool call with a parent agent')
       const limit = requestedLimit(request, record.limit)
-      const run = await this.ctx.subagents.start('spawn', { label: `search ${record.id}`, prompt: [{ type: 'text', text: buildAISearchPrompt(record.keyword, limit) }], parent: execution.agent, signal: execution.signal, outputSchema: OUTPUT_SCHEMA, persona: 'You are a careful web researcher. Use only verified web-search results, never invent URLs or facts, and finish through the structured-output tool.', toolFilter: { allow: ['web_search'] } })
+      const run = await startPrismFlowSubagent(this.ctx, 'spawn', { label: `search ${record.id}`, prompt: [{ type: 'text', text: buildAISearchPrompt(record.keyword, limit) }], parent: execution.agent, signal: execution.signal, outputSchema: OUTPUT_SCHEMA, persona: 'You are a careful web researcher. Use only verified web-search results, never invent URLs or facts, and finish through the structured-output tool.', toolFilter: { allow: ['web_search'] } })
       const result = await settleRun(run)
       if (result.stopReason !== 'completed') throw new Error(`AI Search subagent stopped with reason: ${result.stopReason}`)
       const structured = result.structured && typeof result.structured === 'object' && Array.isArray(result.structured.items) ? result.structured.items : undefined

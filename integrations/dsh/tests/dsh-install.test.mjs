@@ -2,12 +2,13 @@ import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
 import { chmodSync, mkdirSync, writeFileSync } from 'node:fs'
 import { access, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { parse } from 'yaml'
 import { configurePrismFlowRuntime, configureProfileManifest, configureSqliteStorage, detectInstalledDshVersion, findActiveDshProcesses, listProcProcesses, resolveInstallerDshHome, sqliteVersionForDsh } from '../lib/dsh-install.js'
+import { CURRENT_PROCESS_START_IDENTITY } from '../lib/process-start-identity.js'
 
 const windowsDatabase = String.raw`C:\Users\person\dsh\storages\domain.sqlite`
 
@@ -59,7 +60,8 @@ test('one-stop installer recognizes Windows DSH command paths and ignores unrela
 test('one-stop installer accepts every later semantic DSH release and pins the same exact SQLite backend', () => {
   for (const version of [
     '0.1.0-rc.6', '0.1.1-rc.2', '0.1.7-rc.1', '0.1.9',
-    '0.2.0-alpha.1', '0.2.0-rc.1', '1.0.0', '2.3.4-beta.5+build.7',
+    '0.2.0-alpha.1', '0.2.0-rc.1', '0.2.0-rc.2', '0.2.0',
+    '0.2.1-rc.2', '0.2.1', '0.2.9', '0.3.0', '1.0.0', '2.3.4-beta.5+build.7',
   ]) assert.equal(sqliteVersionForDsh(version), version)
   assert.throws(() => sqliteVersionForDsh('0.1.0-rc.5'), /unsupported DSH version/u)
   assert.throws(() => sqliteVersionForDsh('0.1.0-beta.9'), /unsupported DSH version/u)
@@ -142,7 +144,7 @@ test('one-stop installer enables the complete safe runtime and binds every writa
   assert.throws(() => configurePrismFlowRuntime('- insert:\n    - id: prismflow-store-content\n      disabled: true\n', '/safe/home'), /unsupported shape/u)
 })
 
-test('main installer writes runtime, storage, and Dashboard in one Profile patch update', async t => {
+for (const dshVersion of ['0.1.2-rc.1', '0.2.0-rc.2', '0.2.1-rc.2']) test(`main installer writes runtime, storage, and Dashboard for DSH ${dshVersion} in one Profile patch update`, async t => {
   const home = await mkdtemp(join(tmpdir(), 'prismflow-install-main-'))
   t.after(() => rm(home, { recursive: true, force: true }))
   const profile = join(home, 'profiles', 'web')
@@ -152,8 +154,8 @@ test('main installer writes runtime, storage, and Dashboard in one Profile patch
   mkdirSync(sqlitePackage, { recursive: true }); mkdirSync(domainPackage, { recursive: true }); mkdirSync(bin); mkdirSync(downloads); writeFileSync(sourceArtifact, 'verified-test-package')
   writeFileSync(join(profile, 'package.json'), `${JSON.stringify({ name: 'dsh-profile-web', private: true, dependencies: { '@prismflow/dsh': `file:${sourceArtifact.replaceAll('\\', '/')}` }, dsh: { profile: { bundles: ['@deepseek-ai/dsh-base', '@deepseek-ai/dsh-web-app'] } } }, null, 2)}\n`)
   writeFileSync(join(profile, 'cordis.patch.yml'), '[]\n')
-  writeFileSync(join(sqlitePackage, 'package.json'), '{"version":"0.1.2-rc.1"}\n')
-  writeFileSync(join(domainPackage, 'package.json'), '{"version":"0.1.2-rc.1"}\n')
+  writeFileSync(join(sqlitePackage, 'package.json'), JSON.stringify({ version: dshVersion }))
+  writeFileSync(join(domainPackage, 'package.json'), JSON.stringify({ version: dshVersion }))
   const fakePnpm = join(bin, process.platform === 'win32' ? 'pnpm.cmd' : 'pnpm')
   writeFileSync(fakePnpm, process.platform === 'win32' ? '@exit /b 0\r\n' : '#!/bin/sh\nexit 0\n')
   if (process.platform !== 'win32') chmodSync(fakePnpm, 0o755)
@@ -177,6 +179,40 @@ test('main installer writes runtime, storage, and Dashboard in one Profile patch
   assert.equal((await readdir(join(manualRoot, 'plugins'))).filter(name => name.endsWith('.zip')).length, 7)
   await assert.rejects(access(join(home, 'plugins', 'prismflow-personal', 'prismflow-personal-rss')), { code: 'ENOENT' })
   assert.doesNotMatch(result.stdout, /dashboard installed/u)
+})
+
+for (const failure of ['live-owner', 'identified-live-owner', 'foreign-host', 'malformed-owner']) test(`installer reports the exact ${failure} lock failure without mutation or unsafe recovery`, async t => {
+  const home = await mkdtemp(join(tmpdir(), 'prismflow-install-lock-failure-'))
+  t.after(() => rm(home, { recursive: true, force: true }))
+  const profile = join(home, 'profiles', 'web')
+  const locks = join(home, 'locks')
+  mkdirSync(profile, { recursive: true }); mkdirSync(locks)
+  const manifest = JSON.stringify({ name: 'test-profile', private: true, dsh: { profile: { bundles: [] } } })
+  writeFileSync(join(profile, 'package.json'), manifest)
+  writeFileSync(join(profile, 'cordis.patch.yml'), '[]\n')
+  const lockPath = join(locks, 'prismflow-toolsets.lock')
+  const owner = failure === 'malformed-owner' ? 'invalid-lock-owner\n' : JSON.stringify({
+    hostname: failure === 'foreign-host' ? `${hostname()}-other` : hostname(),
+    pid: process.pid, nonce: '11111111-1111-4111-8111-111111111111', createdAt: '2020-01-01T00:00:00.000Z',
+    ...(failure === 'identified-live-owner' ? { processStartIdentity: CURRENT_PROCESS_START_IDENTITY } : {}),
+  })
+  writeFileSync(lockPath, owner)
+  const result = spawnSync(process.execPath, [fileURLToPath(new URL('../scripts/install.mjs', import.meta.url)),
+    '--profile', 'web', '--dsh-home', home, '--dsh-version', '0.1.7-rc.1', '--recover-stopped-locks'], { encoding: 'utf8' })
+  assert.equal(result.status, 1, `${result.stdout}\n${result.stderr}`)
+  assert.ok(result.stdout.includes(`DSH_HOME=${home}`))
+  assert.ok(result.stderr.includes(JSON.stringify(lockPath)), result.stderr)
+  assert.match(result.stderr, /could not acquire writer lock/u)
+  if (failure === 'live-owner' || failure === 'identified-live-owner') assert.ok(result.stderr.includes(`PID ${process.pid}`), result.stderr)
+  else if (failure === 'foreign-host') assert.match(result.stderr, /owned by another hostname/u)
+  else assert.match(result.stderr, /missing, malformed, or unreadable/u)
+  assert.doesNotMatch(result.stderr, /installer requires every DSH process using this home to be stopped/u)
+  assert.equal(await readFile(lockPath, 'utf8'), owner)
+  assert.equal(await readFile(join(profile, 'package.json'), 'utf8'), manifest)
+  assert.equal(await readFile(join(profile, 'cordis.patch.yml'), 'utf8'), '[]\n')
+  // The earlier production lease must be released when the toolset lease fails.
+  await assert.rejects(access(join(locks, 'prismflow-production.lock')), { code: 'ENOENT' })
+  await assert.rejects(access(join(home, 'storages', 'domain.sqlite')), { code: 'ENOENT' })
 })
 
 test('published package exposes the explicit installer without a postinstall hook', async () => {
@@ -214,6 +250,9 @@ test('published package exposes the explicit installer without a postinstall hoo
   assert.match(updaterSource, /--config\.cache-dir=/u)
   assert.match(updaterSource, /if \(Date\.now\(\) - healthySince >= HEALTH_STABILITY_MS\)/u)
   assert.match(updaterSource, /waitForHealth\(port\)/u)
+  assert.ok(updaterSource.includes('/api/prismflow/health'))
+  assert.ok(updaterSource.includes('value.ready === true'))
+  assert.ok(!updaterSource.includes('/api/prismflow/status'))
   assert.match(updaterSource, /if \(updateError && restartError\)/u)
   const escapedVersion = packageJson.version.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   assert.match(readme, new RegExp(`prismflow-dsh-update --package .*prismflow-dsh-${escapedVersion}\\.tgz`, 'u'))

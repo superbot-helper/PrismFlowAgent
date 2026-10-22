@@ -2,7 +2,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { registerPrismFlowTool } from './store-prismflow-toolsets.js'
 
 export const name = 'prismflow-tool-source'
-export const inject = ['tools', 'prismSources']
+export const inject = ['tools', 'prismSources', 'prismToolsets']
 
 export function apply(ctx) {
   registerPrismFlowTool(ctx, defineTool({

@@ -2,7 +2,7 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { registerPrismFlowTool } from './store-prismflow-toolsets.js'
 
 export const name = 'prismflow-tool-content-selection'
-export const inject = ['tools', 'prismContentSelections']
+export const inject = ['tools', 'prismContentSelections', 'prismToolsets']
 
 const EXPLICIT_SOURCE_SELECTION_TOOL = 'prismflow_create_ai_selection_from_explicit_source'
 

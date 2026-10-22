@@ -3,6 +3,7 @@ import { hostname as systemHostname } from 'node:os'
 import { dirname, isAbsolute } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { link, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises'
+import { CURRENT_PROCESS_START_IDENTITY, compareProcessStartIdentities, processStartIdentityFor, validProcessStartIdentity } from './process-start-identity.js'
 
 export const WRITER_LOCK_STALE_AGE_MS = 30_000
 const OWNER_FIELDS = ['hostname', 'pid', 'nonce', 'createdAt']
@@ -16,8 +17,10 @@ function exact(value, fields) {
     && Object.keys(value).length === fields.length && fields.every(field => Object.hasOwn(value, field))
 }
 function validOwner(value) {
-  if (!exact(value, OWNER_FIELDS) || typeof value.hostname !== 'string' || value.hostname.length < 1 || value.hostname.length > 255
-    || /[\u0000-\u001f\u007f]/u.test(value.hostname) || !Number.isInteger(value.pid) || value.pid < 1
+  const legacy = exact(value, OWNER_FIELDS)
+  if ((!legacy && (!exact(value, [...OWNER_FIELDS, 'processStartIdentity']) || !validProcessStartIdentity(value.processStartIdentity)))
+    || typeof value.hostname !== 'string' || value.hostname.length < 1 || value.hostname.length > 255
+    || /[\u0000-\u001f\u007f]/u.test(value.hostname) || !Number.isInteger(value.pid) || value.pid < 1 || value.pid > 2_147_483_647
     || typeof value.nonce !== 'string' || !/^[a-f0-9-]{36}$/u.test(value.nonce)
     || typeof value.createdAt !== 'string' || value.createdAt.length > 40) return undefined
   const timestamp = Date.parse(value.createdAt)
@@ -25,7 +28,7 @@ function validOwner(value) {
   return { ...value, timestamp }
 }
 function processAlive(pid) {
-  try { process.kill(pid, 0); return true } catch (error) { return error?.code === 'EPERM' }
+  try { process.kill(pid, 0); return true } catch (error) { return error?.code !== 'ESRCH' }
 }
 // A persistent container commonly assigns the same low PID after restart. For
 // our own PID, a lock created before this Node process started belongs to the
@@ -33,15 +36,35 @@ function processAlive(pid) {
 function ownerIsPriorCurrentPidIncarnation(owner) {
   return owner.pid === process.pid && owner.timestamp < CURRENT_PROCESS_STARTED_AT_MS
 }
-function ownerProcessAlive(owner) {
-  return !ownerIsPriorCurrentPidIncarnation(owner) && processAlive(owner.pid)
+function ownerIsReused(owner) {
+  if (owner.processStartIdentity !== undefined) {
+    return compareProcessStartIdentities(owner.processStartIdentity, processStartIdentityFor(owner.pid)) === 'different'
+  }
+  // Four-field historical owners cannot identify another process incarnation.
+  // Preserve only the existing own-PID legacy recovery; never guess that an
+  // arbitrary live PID is stale based on a timestamp, argv or lock age.
+  return ownerIsPriorCurrentPidIncarnation(owner)
 }
-function ownerRequiresStaleDelay(owner) { return !ownerIsPriorCurrentPidIncarnation(owner) }
+function ownerProcessAlive(owner) {
+  return processAlive(owner.pid) && !ownerIsReused(owner)
+}
+function ownerRequiresStaleDelay(owner) {
+  // New owners are published only after a complete fsynced identity record.
+  // ESRCH proves their process is gone; no wall-clock grace period is needed.
+  if (owner.processStartIdentity !== undefined && !processAlive(owner.pid)) return false
+  return !ownerIsReused(owner)
+}
+function heldOwnerMessage(owner, label = 'Writer lock') {
+  return owner.processStartIdentity === undefined
+    ? `${label} references active or unverifiable PID ${owner.pid}; this legacy owner has no process-start identity. Confirm all writers are stopped before archiving the old lock.`
+    : `${label} is held by PID ${owner.pid}`
+}
 async function readOwner(path) {
   try { return validOwner(JSON.parse(await readFile(path, 'utf8'))) } catch { return undefined }
 }
 function sameOwner(left, right) {
   return left?.hostname === right.hostname && left?.pid === right.pid && left?.nonce === right.nonce && left?.createdAt === right.createdAt
+    && left?.processStartIdentity === right.processStartIdentity
 }
 function ownerAge(owner, now) { return now - owner.timestamp }
 
@@ -80,7 +103,7 @@ async function reclaimStaleRecovery(recoveryPath, localHostname, now, staleAgeMs
   const owner = await readOwner(recoveryPath)
   if (!owner) throw new WriterLeaseConflictError(`Writer lock recovery owner is missing, malformed, or unreadable: ${recoveryPath}`)
   if (owner.hostname !== localHostname) throw new WriterLeaseConflictError(`Writer lock recovery is owned by another hostname: ${owner.hostname}`)
-  if (ownerProcessAlive(owner)) throw new WriterLeaseConflictError(`Writer lock recovery is held by PID ${owner.pid}`)
+  if (ownerProcessAlive(owner)) throw new WriterLeaseConflictError(heldOwnerMessage(owner, 'Writer lock recovery'))
   if (ownerRequiresStaleDelay(owner) && ownerAge(owner, now) < staleAgeMs) throw new WriterLeaseConflictError('Writer lock recovery owner is dead but has not reached the bounded stale age')
   const quarantine = `${recoveryPath}.stale-${randomUUID()}`
   try { await rename(recoveryPath, quarantine) }
@@ -117,6 +140,28 @@ async function acquireRecovery(recoveryPath, owner, settings) {
   throw new WriterLeaseConflictError('Writer lock stale recovery could not be acquired')
 }
 
+/** Read-only, bounded diagnostic snapshot. Never use this result to authorize recovery. */
+export async function inspectWriterLease(lockPath) {
+  if (typeof lockPath !== 'string' || !isAbsolute(lockPath)) return { state: 'unconfigured' }
+  let owner
+  try {
+    const info = await stat(lockPath)
+    if (!info.isFile() || info.size > 4096) return { state: 'malformed' }
+    owner = validOwner(JSON.parse(await readFile(lockPath, 'utf8')))
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { state: 'missing' }
+    if (error instanceof SyntaxError) return { state: 'malformed' }
+    return { state: 'unreadable' }
+  }
+  if (!owner) return { state: 'malformed' }
+  if (owner.hostname !== systemHostname()) return { state: 'foreign-host' }
+  if (ownerProcessAlive(owner)) {
+    if (owner.processStartIdentity === undefined && owner.pid !== process.pid) return { state: 'legacy-owner-unverified', pid: owner.pid }
+    return { state: 'held', pid: owner.pid, sameProcess: owner.pid === process.pid }
+  }
+  return { state: 'dead-owner' }
+}
+
 /**
  * Acquires a process-lifetime, same-machine writer lease. Shared/network
  * filesystems and multi-host SQLite are intentionally unsupported.
@@ -130,7 +175,8 @@ export async function acquireWriterLease(lockPath, options = {}) {
     staleAgeMs: options.staleAgeMs ?? WRITER_LOCK_STALE_AGE_MS,
   }
   if (!Number.isInteger(settings.staleAgeMs) || settings.staleAgeMs < 1) throw new WriterLeaseValidationError('Writer lock stale age is invalid')
-  const owner = { hostname: settings.hostname, pid: process.pid, nonce: randomUUID(), createdAt: new Date(settings.now()).toISOString() }
+  const owner = { hostname: settings.hostname, pid: process.pid, processStartIdentity: CURRENT_PROCESS_START_IDENTITY,
+    nonce: randomUUID(), createdAt: new Date(settings.now()).toISOString() }
   const recoveryPath = `${lockPath}.recovery`
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
@@ -141,11 +187,11 @@ export async function acquireWriterLease(lockPath, options = {}) {
       const existing = await readOwner(lockPath)
       if (!existing) throw new WriterLeaseConflictError(`Writer lock owner is missing, malformed, or unreadable: ${lockPath}`)
       if (existing.hostname !== settings.hostname) throw new WriterLeaseConflictError(`Writer lock is owned by another hostname: ${existing.hostname}`)
-      if (ownerProcessAlive(existing)) throw new WriterLeaseConflictError(`Writer lock is held by PID ${existing.pid}`)
+      if (ownerProcessAlive(existing)) throw new WriterLeaseConflictError(heldOwnerMessage(existing))
       if (ownerRequiresStaleDelay(existing) && ownerAge(existing, settings.now()) < settings.staleAgeMs) {
         throw new WriterLeaseConflictError('Writer lock owner is dead but has not reached the bounded stale age')
       }
-      const recoveryOwner = { hostname: settings.hostname, pid: process.pid, nonce: randomUUID(), createdAt: new Date(settings.now()).toISOString() }
+      const recoveryOwner = { ...owner, nonce: randomUUID(), createdAt: new Date(settings.now()).toISOString() }
       const recovery = await acquireRecovery(recoveryPath, recoveryOwner, settings)
       try {
         await recovery.assertOwned()

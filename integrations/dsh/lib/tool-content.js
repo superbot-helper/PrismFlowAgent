@@ -1,8 +1,9 @@
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { canStartSubagent, startPrismFlowSubagent } from './subagent-compat.js'
 import { registerPrismFlowTool } from './store-prismflow-toolsets.js'
 
 export const name = 'prismflow-tool-content'
-export const inject = ['tools', 'prismSources', 'prismContentStore', 'prismContentSelections', 'subagents']
+export const inject = ['tools', 'prismSources', 'prismContentStore', 'prismContentSelections', 'subagents', 'prismToolsets']
 
 function bounded(value, max) {
   return typeof value === 'string' ? value.slice(0, max) : ''
@@ -345,7 +346,7 @@ export function apply(ctx) {
       }
 
       const subagents = ctx.get?.('subagents') ?? ctx.subagents
-      if (!subagents || typeof subagents.start !== 'function') {
+      if (!canStartSubagent(subagents)) {
         throw new Error('Subagents service is unavailable for hot keyword extraction')
       }
 
@@ -372,7 +373,7 @@ export function apply(ctx) {
           if (exec.signal?.aborted) throw exec.signal.reason ?? new Error('Aborted')
           const repair = attempt === 0 ? '' : `\n\n上一次输出未通过可信结构校验：${lastError?.message}。这是本次无工具、无副作用的格式修复重试。请重新输出合规的JSON结构。`
           try {
-            const run = await subagents.start(subagentProvider, {
+            const run = await startPrismFlowSubagent(ctx, subagentProvider, {
               label: `PrismFlow hot keywords extraction (${batchIndex + 1}/${totalBatches}${splitDepth > 0 ? ` split:${splitDepth}` : ''})`,
               prompt: [{ type: 'text', text: `${prompt}${repair}` }],
               parent: exec.agent,
@@ -479,7 +480,7 @@ ${candidatePayload}
 <END_CANDIDATE_KEYWORDS_JSON>`
 
         try {
-          const run = await subagents.start(subagentProvider, {
+          const run = await startPrismFlowSubagent(ctx, subagentProvider, {
             label: 'PrismFlow hot keywords consolidation',
             prompt: [{ type: 'text', text: reducePrompt }],
             parent: exec.agent,

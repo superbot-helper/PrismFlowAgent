@@ -60,6 +60,43 @@ test('fresh toolset bootstraps only system Skills and system plugins', async () 
   assert.equal(toolset.version, 1)
 })
 
+for (const mode of ['complete', 'custom']) for (const bundlePresent of [false, true]) test(`restored ${mode} toolsets with an uploaded plugin initialize when its target Bundle is ${bundlePresent ? 'present' : 'absent'}`, async () => {
+  const source = await fixture()
+  const pluginId = 'prismflow-personal-restore-fixture'
+  const tool = 'prismflow_restore_fixture'
+  const manifest = { pluginId, name: 'Restore fixture', description: 'Fixture', origin: 'personal', version: '1', tools: [tool], skills: [], uploaded: true, bundled: false }
+  source.personalPluginManifests.set(pluginId, manifest)
+  const previous = source.getToolset()
+  await source.saveToolset({ mode, enabledPlugins: source.pluginIds(), enabledTools: source.toolNames(), enabledSkills: previous.enabledSkills,
+    expected: { version: previous.version, sha256: previous.sha256 } })
+  const target = await fixture()
+  target.table = new Table()
+  for (const [key, value] of source.table.entries()) await target.table.put(key, value)
+  if (bundlePresent) target.personalPluginManifests.set(pluginId, manifest)
+  await target.bootstrap()
+  assert.equal(target.getToolset().enabledPlugins.includes(pluginId), bundlePresent)
+  assert.equal(target.getToolset().enabledTools.includes(tool), bundlePresent)
+  assert.deepEqual(target.getToolset().enabledTools.filter(name => PRISMFLOW_CORE_TOOL_NAMES.includes(name)), [...PRISMFLOW_CORE_TOOL_NAMES].sort())
+  assert.equal(source.getToolset().enabledPlugins.includes(pluginId), true)
+})
+
+test('missing-plugin migration still rejects unknown namespaces and tools of disabled known plugins', async () => {
+  for (const mutation of [
+    row => { row.enabledPlugins = ['unrelated-plugin'] },
+    row => { row.enabledPlugins.push('prismflow-personal-missing'); row.enabledTools.push('shell_exec') },
+    row => { row.enabledPlugins = ['prismflow-personal-missing']; row.enabledTools = ['prismflow_sources'] },
+  ]) {
+    const store = await fixture()
+    const row = store.getToolset()
+    mutation(row)
+    const snapshot = { mode: row.mode, enabledPlugins: row.enabledPlugins, enabledTools: row.enabledTools, enabledSkills: row.enabledSkills, version: row.version }
+    row.sha256 = digest(snapshot)
+    await store.table.put('@toolset:active', row)
+    await assert.rejects(store.bootstrap())
+    assert.deepEqual(store.table.get('@toolset:active'), row)
+  }
+})
+
 test('Chat prompt suggestions bootstrap in SQLite and save with exact version/SHA CAS', async () => {
   const store = await fixture()
   const current = store.getPromptSuggestions()

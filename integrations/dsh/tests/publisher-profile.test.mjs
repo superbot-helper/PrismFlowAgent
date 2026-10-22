@@ -74,9 +74,39 @@ await test('fixed-scope export and atomic import preserve unrelated rows and req
   }
 
   const current = exportPublisherProfile('web', { home: value.home })
-  const changedConfig = { destinations: [{ ...local, root: tmpdir() }] }
+  const changedConfig = { destinations: [{ ...local, artifactFileNamePattern: 'changed-{date}.md' }] }
   const illegal = { ...change, config: changedConfig, configRevision: publisherConfigRevision('local-markdown', changedConfig) }
   assert.throws(() => validatePublisherChangePlan(plan(current, [illegal]), current), /new immutable destination id/u)
+})
+
+for (const interrupted of [false, true]) await test(`an existing Local root is editable with CAS and retired IDs remain fenced${interrupted ? ' across interrupted state publication' : ''}`, async t => {
+  const value = await fixture(); t.after(value.cleanup)
+  const nextRoot = join(value.home, 'next-root'); mkdirSync(nextRoot)
+  const originalFile = join(value.home, 'old-publication.md'); writeFileSync(originalFile, '# Old')
+  let document = exportPublisherProfile('web', { home: value.home })
+  const local = document.rows.find(row => row.channelKind === 'local-markdown')
+  const original = local.config.destinations[0]
+  const config = normalizePublisherConfig('local-markdown', { destinations: [{ ...original, root: nextRoot }] })
+  const change = { rowId: local.rowId, disabled: local.disabled, config, configRevision: publisherConfigRevision('local-markdown', config) }
+  const update = plan(document, [change])
+  assert.equal(validatePublisherChangePlan(update, document).changes[0].config.destinations[0].root, nextRoot)
+  if (interrupted) {
+    assert.throws(() => importPublisherChangePlan('web', update, { home: value.home, onPowerLossPoint(point) {
+      if (point === 'state-rename-directory-fsynced-before-patch-rename') throw new Error('simulated root-edit interruption')
+    } }), /root-edit interruption/u)
+    assert.equal(exportPublisherProfile('web', { home: value.home }).rows[0].config.destinations[0].root, original.root)
+  }
+  assert.equal(importPublisherChangePlan('web', update, { home: value.home }).imported, true)
+  document = exportPublisherProfile('web', { home: value.home })
+  assert.equal(document.rows[0].config.destinations[0].root, nextRoot)
+  assert.equal(existsSync(originalFile), true); assert.equal(existsSync(join(nextRoot, 'old-publication.md')), false)
+  assert.throws(() => importPublisherChangePlan('web', update, { home: value.home }), /stale/u)
+  const empty = { destinations: [] }
+  importPublisherChangePlan('web', plan(document, [{ ...change, config: empty, configRevision: publisherConfigRevision('local-markdown', empty) }]), { home: value.home })
+  document = exportPublisherProfile('web', { home: value.home })
+  const retiredReuse = normalizePublisherConfig('local-markdown', { destinations: [original] })
+  assert.throws(() => importPublisherChangePlan('web', plan(document, [{ ...change, config: retiredReuse,
+    configRevision: publisherConfigRevision('local-markdown', retiredReuse) }]), { home: value.home }), /cannot be reused|previously used/u)
 })
 
 await test('partial top-level overrides merge over the fixed disabled-empty bundle default', async t => {
