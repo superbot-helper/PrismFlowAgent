@@ -17,7 +17,7 @@ const MESSAGES = {
   malformed: '写入锁格式损坏或路径不是普通文件。为避免并发写入，未自动删除或接管。',
   unreadable: '无法读取 Profile 指定的写入锁。请检查路径、文件权限和挂载状态。',
   'foreign-host': '写入锁属于另一主机或旧容器。已拒绝自动接管；请确认没有其它写入实例，不要直接删锁。',
-  'dead-owner': '写入锁记录属于已退出的本机进程。请停止所有 DSH 实例后执行离线修复，再重新启动。',
+  'dead-owner': '写入锁记录属于已退出或已被复用的本机进程；当前服务启动已失败，因此不会在进程内自行重试。请确认没有其它 DSH 写入实例后重启一次，新版本会通过恢复租约自动接管，无需手工删除锁。',
 }
 
 /** Advisory only: inspect failed stores without opening or modifying their domains. */

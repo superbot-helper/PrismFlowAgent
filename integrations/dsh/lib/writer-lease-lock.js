@@ -5,6 +5,9 @@ import { performance } from 'node:perf_hooks'
 import { link, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises'
 import { CURRENT_PROCESS_START_IDENTITY, compareProcessStartIdentities, processStartIdentityFor, validProcessStartIdentity } from './process-start-identity.js'
 
+// Retained for callers compiled against older releases. Proven-dead owners no
+// longer wait on wall-clock age; staleAgeMs is validated but does not weaken or
+// delay the recovery-lease and exact-owner checks.
 export const WRITER_LOCK_STALE_AGE_MS = 30_000
 const OWNER_FIELDS = ['hostname', 'pid', 'nonce', 'createdAt']
 const CURRENT_PROCESS_STARTED_AT_MS = Math.floor(performance.timeOrigin)
@@ -48,12 +51,6 @@ function ownerIsReused(owner) {
 function ownerProcessAlive(owner) {
   return processAlive(owner.pid) && !ownerIsReused(owner)
 }
-function ownerRequiresStaleDelay(owner) {
-  // New owners are published only after a complete fsynced identity record.
-  // ESRCH proves their process is gone; no wall-clock grace period is needed.
-  if (owner.processStartIdentity !== undefined && !processAlive(owner.pid)) return false
-  return !ownerIsReused(owner)
-}
 function heldOwnerMessage(owner, label = 'Writer lock') {
   return owner.processStartIdentity === undefined
     ? `${label} references active or unverifiable PID ${owner.pid}; this legacy owner has no process-start identity. Confirm all writers are stopped before archiving the old lock.`
@@ -66,8 +63,6 @@ function sameOwner(left, right) {
   return left?.hostname === right.hostname && left?.pid === right.pid && left?.nonce === right.nonce && left?.createdAt === right.createdAt
     && left?.processStartIdentity === right.processStartIdentity
 }
-function ownerAge(owner, now) { return now - owner.timestamp }
-
 // The complete owner is fsynced in a same-directory candidate before its hard
 // link is atomically published as the canonical lock. A crash can leave only an
 // irrelevant candidate, never an empty/mid-write canonical owner.
@@ -99,12 +94,11 @@ async function removeExactOwner(path, owner, inode) {
   try { await unlink(path); return true } catch (error) { if (error?.code === 'ENOENT') return false; throw error }
 }
 
-async function reclaimStaleRecovery(recoveryPath, localHostname, now, staleAgeMs) {
+async function reclaimStaleRecovery(recoveryPath, localHostname) {
   const owner = await readOwner(recoveryPath)
   if (!owner) throw new WriterLeaseConflictError(`Writer lock recovery owner is missing, malformed, or unreadable: ${recoveryPath}`)
   if (owner.hostname !== localHostname) throw new WriterLeaseConflictError(`Writer lock recovery is owned by another hostname: ${owner.hostname}`)
   if (ownerProcessAlive(owner)) throw new WriterLeaseConflictError(heldOwnerMessage(owner, 'Writer lock recovery'))
-  if (ownerRequiresStaleDelay(owner) && ownerAge(owner, now) < staleAgeMs) throw new WriterLeaseConflictError('Writer lock recovery owner is dead but has not reached the bounded stale age')
   const quarantine = `${recoveryPath}.stale-${randomUUID()}`
   try { await rename(recoveryPath, quarantine) }
   catch (error) { if (error?.code === 'ENOENT') return false; throw error }
@@ -116,7 +110,7 @@ async function reclaimStaleRecovery(recoveryPath, localHostname, now, staleAgeMs
   return true
 }
 
-async function acquireRecovery(recoveryPath, owner, settings) {
+async function acquireRecovery(recoveryPath, owner) {
   for (let attempt = 0; attempt < 4; attempt += 1) {
     try {
       const inode = await publishOwner(recoveryPath, owner)
@@ -133,7 +127,7 @@ async function acquireRecovery(recoveryPath, owner, settings) {
       if (!['EEXIST', 'EACCES', 'EPERM'].includes(error?.code)) throw error
       // EACCES/EPERM while publishing can mean the canonical path exists on
       // Windows. Reading it below still fails closed if that is not the case.
-      const reclaimed = await reclaimStaleRecovery(recoveryPath, owner.hostname, settings.now(), settings.staleAgeMs)
+      const reclaimed = await reclaimStaleRecovery(recoveryPath, owner.hostname)
       if (!reclaimed) continue
     }
   }
@@ -188,16 +182,12 @@ export async function acquireWriterLease(lockPath, options = {}) {
       if (!existing) throw new WriterLeaseConflictError(`Writer lock owner is missing, malformed, or unreadable: ${lockPath}`)
       if (existing.hostname !== settings.hostname) throw new WriterLeaseConflictError(`Writer lock is owned by another hostname: ${existing.hostname}`)
       if (ownerProcessAlive(existing)) throw new WriterLeaseConflictError(heldOwnerMessage(existing))
-      if (ownerRequiresStaleDelay(existing) && ownerAge(existing, settings.now()) < settings.staleAgeMs) {
-        throw new WriterLeaseConflictError('Writer lock owner is dead but has not reached the bounded stale age')
-      }
       const recoveryOwner = { ...owner, nonce: randomUUID(), createdAt: new Date(settings.now()).toISOString() }
-      const recovery = await acquireRecovery(recoveryPath, recoveryOwner, settings)
+      const recovery = await acquireRecovery(recoveryPath, recoveryOwner)
       try {
         await recovery.assertOwned()
         const confirmed = await readOwner(lockPath)
-        if (!sameOwner(confirmed, existing) || confirmed.hostname !== settings.hostname || ownerProcessAlive(confirmed)
-          || ownerRequiresStaleDelay(confirmed) && ownerAge(confirmed, settings.now()) < settings.staleAgeMs) continue
+        if (!sameOwner(confirmed, existing) || confirmed.hostname !== settings.hostname || ownerProcessAlive(confirmed)) continue
         if (typeof options.onRecoveryAcquired === 'function') await options.onRecoveryAcquired({ lockPath, owner: structuredClone(confirmed) })
         await recovery.assertOwned()
         const inode = (await stat(lockPath)).ino

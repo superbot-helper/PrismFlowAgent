@@ -294,7 +294,7 @@ function deadOwner(overrides = {}) {
     createdAt: new Date(Date.now() - 60_000).toISOString(), ...overrides }
 }
 
-test('lease writer lock excludes a subprocess owner, reclaims bounded same-host dead leases, and releases only its owner', async () => {
+test('lease writer lock excludes a subprocess owner, reclaims same-host dead leases, and releases only its owner', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'prismflow-workflow-lock-'))
   const lockPath = join(directory, 'writer.lock')
   try {
@@ -352,14 +352,13 @@ test('lease writer lock creates a missing parent directory before publishing its
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
-test('lease locks never steal foreign-host, empty, malformed, or fresh dead-owner files', async () => {
+test('lease locks never steal foreign-host, empty, or malformed owner files', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'prismflow-workflow-lock-invalid-'))
   try {
     for (const [name, setup, pattern] of [
       ['foreign', path => writeLockOwner(path, deadOwner({ hostname: 'other-host.example' })), /another hostname/],
       ['empty', path => writeFile(path, ''), /missing, malformed, or unreadable/],
       ['malformed', path => writeFile(path, '{'), /missing, malformed, or unreadable/],
-      ['fresh', path => writeLockOwner(path, deadOwner({ createdAt: new Date().toISOString() })), /bounded stale age/],
     ]) {
       const lockPath = join(directory, name); await setup(lockPath)
       await assert.rejects(acquireWorkflowWriterLock(lockPath, { staleAgeMs: 30_000 }), pattern)
@@ -367,7 +366,21 @@ test('lease locks never steal foreign-host, empty, malformed, or fresh dead-owne
   } finally { await rm(directory, { recursive: true, force: true }) }
 })
 
-test('a crash-mid-recovery lease is itself reclaimed only after same-host dead-owner staleness', async () => {
+test('a fresh legacy lock with a definitively absent local PID is recovered during the first quick restart', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'prismflow-workflow-lock-legacy-restart-'))
+  const lockPath = join(directory, 'writer.lock')
+  try {
+    await writeLockOwner(lockPath, deadOwner({ createdAt: new Date().toISOString() }))
+    const release = await acquireWorkflowWriterLock(lockPath, { staleAgeMs: 24 * 60 * 60 * 1000 })
+    const current = JSON.parse(await readFile(lockPath, 'utf8'))
+    assert.equal(current.pid, process.pid)
+    assert.equal(typeof current.processStartIdentity, 'string')
+    await release()
+    await assert.rejects(readFile(lockPath), { code: 'ENOENT' })
+  } finally { await rm(directory, { recursive: true, force: true }) }
+})
+
+test('a crash-mid-recovery lease with an absent local PID is reclaimed immediately', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'prismflow-workflow-recovery-'))
   const lockPath = join(directory, 'writer.lock')
   try {

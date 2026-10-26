@@ -937,9 +937,12 @@ async function routeRequest(ctx, req, res, requestUrl, profileBinding) {
   const mutating = method === 'POST' || method === 'PUT'
   if (method === 'GET' && pathname === `${API_PREFIX}/health`) {
     // The offline updater has no browser session. Expose only package identity
-    // on the old strict loopback boundary, never configuration or store data.
+    // and one aggregate readiness bit on the strict loopback boundary, never
+    // configuration, lock metadata, service names, or store data. A loaded UI
+    // alone is not healthy when writer-lock failures kept critical stores down.
     validateLocalDashboardAccess(req)
-    return jsonResponse(res, 200, { version: 1, pluginVersion: PLUGIN_VERSION, ready: true })
+    const ready = ['prismToolsets', 'prismProduction', 'prismGeneratorWorkflows'].every(name => ctx.get(name) !== undefined)
+    return jsonResponse(res, 200, { version: 1, pluginVersion: PLUGIN_VERSION, ready })
   }
   validateDashboardAccess(ctx, req, mutating)
 

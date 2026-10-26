@@ -16,6 +16,7 @@ export const Config = Schema.object({
 })
 
 const SHA256 = /^[a-f0-9]{64}$/u
+const SHARP_TIMEOUT_SECONDS = 60
 const assetSchema = z.object({
   assetId: z.string().regex(SHA256), sha256: z.string().regex(SHA256), bytes: z.number().int().min(1).max(32 * 1024 * 1024),
   mime: z.enum(['image/jpeg', 'image/png', 'image/gif']), width: z.number().int().min(1).max(100_000), height: z.number().int().min(1).max(100_000),
@@ -107,16 +108,19 @@ export class PrismProductionMediaService extends Service {
     try { inspectImage(bytes) }
     catch {
       try {
-        const source = await sharp(bytes, { failOn: 'error', limitInputPixels: 100_000_000, animated: false }).metadata()
+        const source = await sharp(bytes, { failOn: 'error', limitInputPixels: 100_000_000, animated: false })
+          .timeout({ seconds: SHARP_TIMEOUT_SECONDS }).metadata()
         if (!['avif', 'heif', 'webp'].includes(source.format ?? '')) throw new Error('unsupported source image')
         bytes = await sharp(bytes, { failOn: 'error', limitInputPixels: 100_000_000, animated: false })
-          .rotate().flatten({ background: '#ffffff' }).jpeg({ quality: 90, progressive: false, chromaSubsampling: '4:2:0' }).toBuffer()
+          .timeout({ seconds: SHARP_TIMEOUT_SECONDS }).rotate().flatten({ background: '#ffffff' })
+          .jpeg({ quality: 90, progressive: false, chromaSubsampling: '4:2:0' }).toBuffer()
       } catch { throw new Error('Production media must be a structurally recognized JPG, PNG, GIF, AVIF, or WebP image') }
     }
     if (bytes.length < 1 || bytes.length > this.config.maxAssetBytes) throw new Error('Production media asset exceeds its admission limit after conversion')
     const dimensions = inspectImage(bytes)
     let decoded
-    try { decoded = await sharp(bytes, { failOn: 'error', limitInputPixels: 100_000_000, animated: true }).metadata() }
+    try { decoded = await sharp(bytes, { failOn: 'error', limitInputPixels: 100_000_000, animated: true })
+      .timeout({ seconds: SHARP_TIMEOUT_SECONDS }).metadata() }
     catch { throw new Error('Production media image decoding failed') }
     const decodedMime = decoded.format === 'jpeg' ? 'image/jpeg' : decoded.format === 'png' ? 'image/png' : decoded.format === 'gif' ? 'image/gif' : undefined
     if (decodedMime !== dimensions.mime || decoded.width !== dimensions.width || decoded.height !== dimensions.height

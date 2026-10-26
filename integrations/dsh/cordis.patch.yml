@@ -248,9 +248,16 @@
         imageApiProtocol: auto
         imageModel: gpt-image-1
         imageSize: 1024x1024
+        convertImages: true
         avifQuality: 70
         avifEffort: 5
+        sharpThreads: 1
+        imageConversionTimeoutSeconds: 60
+        convertVideos: true
         ffmpegPath: ''
+        ffmpegThreads: 1
+        videoConversionTimeoutMs: 90000
+        mediaProcessingTimeoutMs: 180000
         videoCrf: 28
         videoPreset: slow
         maxVideoBytes: 26214400

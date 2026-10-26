@@ -20,7 +20,7 @@ const VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.
 function usage() {
   console.error('Usage: prismflow-dsh-install [--profile <name>] [--dsh-home <path>] [--dsh-version <version>] [--recover-stopped-locks] [--migrate-json --confirm-dsh-stopped]')
   console.error('Legacy migration flags remain accepted, but JSON storage is now migrated automatically after active DSH processes are ruled out. Use prismflow-dsh-update for automatic stop, update, restart, and health checking.')
-  console.error('--recover-stopped-locks shortens only the dead-owner stale delay; it never bypasses a live, foreign-host, malformed, or unreadable lock. Stop every DSH process before using it.')
+  console.error('--recover-stopped-locks is retained for command compatibility; dead local owners now recover immediately. It never bypasses a live, foreign-host, malformed, or unreadable lock. Stop every DSH process before installation.')
 }
 function fail(message) { throw new Error(`PrismFlow DSH installer: ${message}`) }
 function takeValue(args, index, option) {
@@ -32,7 +32,7 @@ function parseArgs(argv) {
   const result = {
     profileName: '',
     dshHome: resolveInstallerDshHome(undefined, process.env, homedir()),
-    dshVersion: process.env.DSH_VERSION ?? '', migrateJson: false, confirmStopped: false, recoverStoppedLocks: false,
+    dshVersion: process.env.DSH_VERSION ?? '', migrateJson: false, confirmStopped: false,
   }
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]
@@ -41,7 +41,7 @@ function parseArgs(argv) {
     else if (argument === '--dsh-version') { result.dshVersion = takeValue(argv, index, argument); index += 1 }
     else if (argument === '--migrate-json') result.migrateJson = true
     else if (argument === '--confirm-dsh-stopped') result.confirmStopped = true
-    else if (argument === '--recover-stopped-locks') result.recoverStoppedLocks = true
+    else if (argument === '--recover-stopped-locks') { /* accepted for compatibility */ }
     else if (argument === '--help' || argument === '-h') return { help: true }
     else fail(`unknown option ${argument}`)
   }
@@ -188,13 +188,13 @@ function assertDshIsOffline(options) {
   }
 }
 
-async function acquireInstallationLocks(paths, recoverStoppedLocks = false) {
+async function acquireInstallationLocks(paths) {
   const releases = []
   let acquiringPath
   try {
     for (const path of paths) {
       acquiringPath = path
-      releases.push(await acquireWriterLease(path, recoverStoppedLocks ? { staleAgeMs: 1 } : undefined))
+      releases.push(await acquireWriterLease(path))
     }
     return async () => {
       const failures = []
@@ -249,7 +249,7 @@ async function main() {
     console.log(`Detected ${jsonUnits.length} JSON storage units and no SQLite database; starting verified automatic migration.`)
   }
 
-  const releaseLocks = await acquireInstallationLocks(writerLockPaths(originalPatch, binding.dshHome), options.recoverStoppedLocks)
+  const releaseLocks = await acquireInstallationLocks(writerLockPaths(originalPatch, binding.dshHome))
   try {
     if (!databaseExists && jsonUnits.length) {
       const migrated = await migrateJsonStorageToSqlite({ storageRoot, databasePath })

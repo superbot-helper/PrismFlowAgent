@@ -720,6 +720,17 @@ test('status remains readable when the three writable stores failed and projects
   } finally { await app?.close(); await rm(home, { recursive: true, force: true }) }
 })
 
+test('loopback health remains unready when a writer-locked critical store failed to register', async () => {
+  const configured = services() // fixture has Production/Workflow but intentionally no Toolset store
+  const app = await dashboard(configured)
+  try {
+    const health = await request(app.origin, '/health')
+    assert.equal(health.status, 200)
+    assert.deepEqual(health.value, { version: 1, pluginVersion: PACKAGE_VERSION, ready: false })
+    assert.deepEqual(Object.keys(health.value).sort(), ['pluginVersion', 'ready', 'version'])
+  } finally { await app.close() }
+})
+
 test('authenticated DSH admission supports a trusted public Host and proxy port without losing CSRF and login checks', async () => {
   // Use DSH's real Host/Origin and owner-admission implementation. Only its
   // credential verifier is stubbed; PrismFlow never parses browser cookies.
@@ -728,7 +739,7 @@ test('authenticated DSH admission supports a trusted public Host and proxy port 
     authenticateApi() { return undefined },
   })
   const calls = []
-  const app = await dashboard({ ...services(), connection, prismContentStore: {
+  const app = await dashboard({ ...services(), prismToolsets: {}, connection, prismContentStore: {
     async deleteBatch(ids) { calls.push(ids); return { deletedIds: ids, missingIds: [], failedIds: [] } },
   } })
   const cookie = { cookie: 'test-session=valid' }

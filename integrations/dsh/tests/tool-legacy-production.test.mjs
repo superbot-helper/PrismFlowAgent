@@ -3,11 +3,11 @@ import { createHash, randomBytes } from 'node:crypto'
 import test from 'node:test'
 import sharp from 'sharp'
 import Parser from 'rss-parser'
-import { apply, resolveFfmpegPath } from '../lib/tool-legacy-production.js'
+import { apply, ffmpegVideoArgs, resolveFfmpegPath } from '../lib/tool-legacy-production.js'
 import { ffmpegCandidatePaths } from '../lib/ffmpeg-runtime.js'
 import { ManagedRssFetchError } from '../lib/secure-rss-fetch.js'
 
-const config = { imageApiKeyCredential: 'IMAGE_API_KEY', imageApiUrl: 'https://images.example/v1/images/generations', imageApiProtocol: 'auto', imageModel: 'fixed-model', imageSize: '2K', avifQuality: 70, avifEffort: 5, ffmpegPath: 'ffmpeg', videoCrf: 28, videoPreset: 'slow', maxVideoBytes: 25 * 1024 * 1024, githubCredential: 'GH', workflowOwner: 'owner', workflowRepository: 'repo', workflowId: 'build.yml', workflowRef: 'main', rssSiteUrl: 'https://example.com/docs/', rssFeedUrl: 'https://feeds.example.com/rss.xml', rssMaxItems: 7 }
+const config = { imageApiKeyCredential: 'IMAGE_API_KEY', imageApiUrl: 'https://images.example/v1/images/generations', imageApiProtocol: 'auto', imageModel: 'fixed-model', imageSize: '2K', convertImages: true, avifQuality: 70, avifEffort: 5, sharpThreads: 1, imageConversionTimeoutSeconds: 60, convertVideos: true, ffmpegPath: 'ffmpeg', ffmpegThreads: 1, videoConversionTimeoutMs: 90_000, mediaProcessingTimeoutMs: 180_000, videoCrf: 28, videoPreset: 'slow', maxVideoBytes: 25 * 1024 * 1024, githubCredential: 'GH', workflowOwner: 'owner', workflowRepository: 'repo', workflowId: 'build.yml', workflowRef: 'main', rssSiteUrl: 'https://example.com/docs/', rssFeedUrl: 'https://feeds.example.com/rss.xml', rssMaxItems: 7 }
 function harness(runtimeConfig = config, services = {}) {
   const tools = new Map(); const calls = []
   const draft = { draftId: 'draft-1', version: 2, sha256: 'a'.repeat(64), status: 'approved', title: 'A & B', markdown: '# Safe & sound\n\n**Bold** and [source](https://example.com/a?x=1&y=2).', approvedAt: '2026-01-02T00:00:00.000Z' }
@@ -47,6 +47,10 @@ test('FFmpeg supports cross-system defaults, manual paths, PATH executable names
   assert.equal(selected, '/usr/bin/ffmpeg')
   await assert.rejects(resolveFfmpegPath('./relative/ffmpeg', { platform: 'linux', env: {}, home: '/home/person' }), /must be absolute/)
   await assert.rejects(resolveFfmpegPath('/missing/ffmpeg', { platform: 'linux', env: {}, home: '/home/person', access: async () => { throw new Error('missing') } }), error => error.code === 'PRISMFLOW_FFMPEG_CONFIGURATION')
+  const args = ffmpegVideoArgs('/tmp/input', '/tmp/output.mp4', config)
+  assert.deepEqual(args.slice(0, 5), ['-nostdin', '-loglevel', 'error', '-y', '-i'])
+  assert.deepEqual(args.slice(args.indexOf('-filter_threads'), args.indexOf('-filter_threads') + 2), ['-filter_threads', '1'])
+  assert.deepEqual(args.slice(args.indexOf('-threads'), args.indexOf('-threads') + 2), ['-threads', '1'])
 })
 
 test('compatibility and publication tools are native, and RSS generation converts and locally persists exact-approved HTML', async () => {
@@ -122,6 +126,46 @@ test('prismflow_process_markdown_media ports linked images, HTML images, proxyin
   const result = await tools.get('prismflow_process_markdown_media').execute({ content }, execution)
   assert.match(result.content, /https:\/\/cdn\.example\/media\/1\.avif/); assert.doesNotMatch(result.content, /elsewhere\.example/); assert.match(result.content, /<img src="https:\/\/cdn\.example\/media\/2\.avif">/); assert.doesNotMatch(result.content, /qbitai/)
   assert.equal(uploads.length, 2); assert.ok(uploads.every(item => item.mime === 'image/avif')); assert.equal(result.omitted, 1)
+})
+
+test('prismflow_process_markdown_media can preserve original image bytes and applies the main runtime one-thread Sharp policy', async () => {
+  const png = await sharp({ create: { width: 2, height: 2, channels: 3, background: '#336699' } }).png().toBuffer()
+  const tools = new Map(); const uploads = []; const toolsets = { isToolEnabled: () => true }
+  const claim = { assetId: 'b'.repeat(64), sha256: 'b'.repeat(64), bytes: png.length, mime: 'image/png', width: 2, height: 2 }
+  const ctx = { get(key) { if (key === 'prismToolsets') return toolsets; if (key === 'prismMediaFetch') return async () => new Response(png, { headers: { 'content-type': 'image/png' } }) },
+    tools: { register(tool) { tools.set(tool.name, tool); return () => {} } }, credentials: {}, prismProduction: {},
+    prismProductionMedia: { async ingest(bytes) { assert.deepEqual(bytes, png); return claim } },
+    prismPublishers: { resolveMediaUploaderId() { return 'r2-markdown:media' }, ownsMediaUrl() { return false }, async uploadMedia(_id, bytes, mime) { uploads.push({ bytes, mime }); return { publicUrl: 'https://cdn.example/original.png' } } } }
+  apply(ctx, { ...config, convertImages: false })
+  assert.equal(sharp.concurrency(), 1)
+  const result = await tools.get('prismflow_process_markdown_media').execute({ content: '![image](https://safe.example/image.png)' }, execution)
+  assert.equal(uploads.length, 1); assert.equal(uploads[0].mime, 'image/png'); assert.deepEqual(uploads[0].bytes, png)
+  assert.match(result.content, /cdn\.example\/original\.png/u); assert.deepEqual(result.mediaAssets, [claim])
+})
+
+test('concurrent Markdown media calls serialize CPU-bound Production image admission', async () => {
+  const png = await sharp({ create: { width: 2, height: 2, channels: 3, background: '#336699' } }).png().toBuffer()
+  const tools = new Map(); const toolsets = { isToolEnabled: () => true }; let active = 0; let maximum = 0
+  const ctx = { get(key) { if (key === 'prismToolsets') return toolsets; if (key === 'prismMediaFetch') return async () => new Response(png, { headers: { 'content-type': 'image/png' } }) },
+    tools: { register(tool) { tools.set(tool.name, tool); return () => {} } }, credentials: {}, prismProduction: {},
+    prismProductionMedia: { async ingest() { active += 1; maximum = Math.max(maximum, active); await new Promise(resolve => setTimeout(resolve, 20)); active -= 1; return { assetId: randomBytes(32).toString('hex'), sha256: randomBytes(32).toString('hex'), bytes: png.length, mime: 'image/png', width: 2, height: 2 } } },
+    prismPublishers: { resolveMediaUploaderId() { return 'r2-markdown:media' }, ownsMediaUrl() { return false }, async uploadMedia(_id, _bytes, _mime) { return { publicUrl: 'https://cdn.example/image.png' } } } }
+  apply(ctx, { ...config, convertImages: false })
+  const tool = tools.get('prismflow_process_markdown_media')
+  await Promise.all([
+    tool.execute({ content: '![one](https://safe.example/one.png)' }, { signal: new AbortController().signal }),
+    tool.execute({ content: '![two](https://safe.example/two.png)' }, { signal: new AbortController().signal }),
+  ])
+  assert.equal(maximum, 1)
+})
+
+test('Markdown media has one bounded invocation deadline that aborts a stalled fetch', async () => {
+  const tools = new Map(); const toolsets = { isToolEnabled: () => true }
+  const ctx = { get(key) { if (key === 'prismToolsets') return toolsets; if (key === 'prismMediaFetch') return (_url, { signal }) => new Promise((_resolve, reject) => { const keepAlive = setTimeout(() => reject(new Error('test fetch did not abort')), 1_000); signal.addEventListener('abort', () => { clearTimeout(keepAlive); reject(signal.reason) }, { once: true }) }) },
+    tools: { register(tool) { tools.set(tool.name, tool); return () => {} } }, credentials: {}, prismProduction: {}, prismProductionMedia: {},
+    prismPublishers: { resolveMediaUploaderId() { return 'r2-markdown:media' }, ownsMediaUrl() { return false } } }
+  apply(ctx, { ...config, mediaProcessingTimeoutMs: 10 })
+  await assert.rejects(tools.get('prismflow_process_markdown_media').execute({ content: '![stalled](https://safe.example/stalled.png)' }, execution), /timed out|timeout/iu)
 })
 
 test('prismflow_process_markdown_media preserves the original tri-state delete, retain, and rewrite semantics', async () => {

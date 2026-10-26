@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { hostname, tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { CURRENT_PROCESS_START_IDENTITY, compareProcessStartIdentities, linuxProcessStartIdentity, processStartIdentityFor, validProcessStartIdentity } from '../lib/process-start-identity.js'
+import { CURRENT_PROCESS_START_IDENTITY, compareProcessStartIdentities, linuxProcessStartIdentity, processStartIdentityFor, validProcessStartIdentity, windowsProcessStartIdentity } from '../lib/process-start-identity.js'
 import { acquireWriterLease, inspectWriterLease } from '../lib/writer-lease-lock.js'
 
 const BOOT = '11111111-1111-4111-8111-111111111111'
@@ -37,6 +37,17 @@ test('Linux PID identity uses kernel boot ID and start ticks, including comm fie
   assert.equal(compareProcessStartIdentities(first, undefined), 'unknown')
   assert.equal(compareProcessStartIdentities(first, 'process-start-epoch-ms:1234'), 'unknown')
   assert.equal(validProcessStartIdentity('argv:node web'), false)
+})
+
+test('Windows process creation FILETIME identities are strict and comparable without trusting command lines', () => {
+  const first = windowsProcessStartIdentity(39, pid => pid === 39 ? '133700000000000000' : undefined)
+  assert.equal(first, 'windows-process-filetime-v1:133700000000000000')
+  assert.equal(windowsProcessStartIdentity(0, () => '133700000000000000'), undefined)
+  assert.equal(windowsProcessStartIdentity(39, () => 'not-a-filetime'), undefined)
+  assert.equal(windowsProcessStartIdentity(39, () => { throw new Error('unreadable') }), undefined)
+  assert.equal(compareProcessStartIdentities(first, first), 'same')
+  assert.equal(compareProcessStartIdentities(first, 'windows-process-filetime-v1:133700000000000001'), 'different')
+  assert.equal(compareProcessStartIdentities(first, `linux-proc-v1:${BOOT}:1`), 'unknown')
 })
 
 test('a new-format live owner is never stolen because its timestamp predates the current process', async t => {
@@ -97,6 +108,22 @@ test('a stale recovery owner with a reused birth identity is also reclaimed, wit
   await writeFile(lock, JSON.stringify(foreign))
   await assert.rejects(acquireWriterLease(lock), /another hostname/u)
   assert.deepEqual(JSON.parse(await readFile(lock, 'utf8')), foreign)
+})
+
+test('Windows can distinguish a reused other PID from a genuine live subprocess owner', { skip: process.platform !== 'win32' }, async t => {
+  const { lock } = await fixture(t)
+  const child = spawn(process.execPath, ['-e', 'console.log("ready"); process.stdin.resume()'], { stdio: ['pipe', 'pipe', 'inherit'] })
+  try {
+    await once(child.stdout, 'data')
+    const identity = processStartIdentityFor(child.pid)
+    assert.match(identity ?? '', /^windows-process-filetime-v1:/u)
+    const data = owner({ pid: child.pid, processStartIdentity: identity })
+    await writeFile(lock, JSON.stringify(data))
+    await assert.rejects(acquireWriterLease(lock), /held by PID/u)
+    data.processStartIdentity = differentIdentity(identity); await writeFile(lock, JSON.stringify(data))
+    const release = await acquireWriterLease(lock, { staleAgeMs: 24 * 60 * 60 * 1000 })
+    await release()
+  } finally { const exited = once(child, 'exit'); child.stdin.end(); await exited }
 })
 
 test('Linux can distinguish a reused other PID from a genuine live subprocess owner', { skip: process.platform !== 'linux' }, async t => {

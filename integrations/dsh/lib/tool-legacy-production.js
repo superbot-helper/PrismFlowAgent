@@ -27,9 +27,16 @@ export const Config = Schema.object({
   imageApiProtocol: Schema.union(['auto', 'chat-completions', 'images-generations']).default('auto'),
   imageModel: Schema.string().default('gpt-image-1'),
   imageSize: Schema.string().default('1024x1024'),
+  convertImages: Schema.boolean().default(true),
   avifQuality: Schema.number().step(1).min(1).max(100).default(70),
   avifEffort: Schema.number().step(1).min(0).max(9).default(5),
+  sharpThreads: Schema.number().step(1).min(1).max(4).default(1),
+  imageConversionTimeoutSeconds: Schema.number().step(1).min(5).max(300).default(60),
+  convertVideos: Schema.boolean().default(true),
   ffmpegPath: Schema.string().default(''),
+  ffmpegThreads: Schema.number().step(1).min(1).max(4).default(1),
+  videoConversionTimeoutMs: Schema.number().step(1).min(10_000).max(300_000).default(90_000),
+  mediaProcessingTimeoutMs: Schema.number().step(1).min(30_000).max(900_000).default(180_000),
   videoCrf: Schema.number().step(1).min(0).max(51).default(28),
   videoPreset: Schema.string().default('slow'),
   maxVideoBytes: Schema.number().step(1).min(1_048_576).max(32 * 1024 * 1024).default(25 * 1024 * 1024),
@@ -60,18 +67,34 @@ function approvedDraft(ctx, args) {
   if (draft.version !== args.draftVersion || draft.sha256 !== args.artifactSha256 || !SHA.test(args.artifactSha256 ?? '')) throw new Error('Draft version/SHA-256 approval binding does not match')
   return draft
 }
+let mediaConversionTail = Promise.resolve()
+async function serializeMediaConversion(operation, signal) {
+  const before = mediaConversionTail.catch(() => {})
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  mediaConversionTail = before.then(() => gate)
+  await before
+  try {
+    if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error('Media conversion aborted')
+    return await operation()
+  } finally { release() }
+}
+function sharpTimeout(config) {
+  return Number.isInteger(config.imageConversionTimeoutSeconds) ? config.imageConversionTimeoutSeconds : 60
+}
 async function convertImageForR2(bytes, sourceMime, config) {
-  const input = sharp(bytes, { failOn: 'error', animated: true, limitInputPixels: 100_000_000 })
+  const timeout = sharpTimeout(config)
+  const input = sharp(bytes, { failOn: 'error', animated: true, limitInputPixels: 100_000_000 }).timeout({ seconds: timeout })
   const metadata = await input.metadata()
   const pages = metadata.pages ?? 1
   if (!metadata.width || !metadata.height || metadata.width * metadata.height * pages > 100_000_000) throw new Error('Image pixel dimensions exceed the conversion limit')
-  if (pages > 1) {
-    const claimBytes = ['image/jpeg', 'image/png', 'image/gif'].includes(sourceMime) ? bytes : await sharp(bytes, { failOn: 'error', page: 0, limitInputPixels: 100_000_000 }).png().toBuffer()
-    return { uploadBytes: bytes, uploadMime: sourceMime, claimBytes, animated: true }
-  }
-  const uploadBytes = await sharp(bytes, { failOn: 'error', limitInputPixels: 100_000_000 }).avif({ quality: config.avifQuality, effort: config.avifEffort }).toBuffer()
-  const claimBytes = await sharp(uploadBytes, { failOn: 'error', limitInputPixels: 100_000_000 }).png().toBuffer()
-  return { uploadBytes, uploadMime: 'image/avif', claimBytes, animated: false }
+  if (pages > 1 || config.convertImages === false) return { uploadBytes: bytes, uploadMime: sourceMime, claimBytes: bytes, animated: pages > 1 }
+  // Keep the original decoded representation for the trusted Production claim.
+  // Re-decoding the newly encoded AVIF into PNG doubled CPU and memory without
+  // adding provenance; ProductionMedia already validates or normalizes it.
+  const uploadBytes = await sharp(bytes, { failOn: 'error', limitInputPixels: 100_000_000 })
+    .timeout({ seconds: timeout }).avif({ quality: config.avifQuality, effort: config.avifEffort }).toBuffer()
+  return { uploadBytes, uploadMime: 'image/avif', claimBytes: bytes, animated: false }
 }
 const IMAGE_DELETE_DOMAINS = ['chinaz.com', 'qbitai.com', 'jiqizhixin.com']
 const VIDEO_DELETE_DOMAINS = ['chinaz.com']
@@ -96,17 +119,32 @@ function cleanMediaBreaks(content) {
     return /<img[^>]*>|<video[^>]*>/iu.test(lines[index - 1] ?? '') || /<img[^>]*>|<video[^>]*>/iu.test(lines[index + 1] ?? '')
   }).join('\n')
 }
+export function ffmpegVideoArgs(input, output, config) {
+  const threads = Number.isInteger(config.ffmpegThreads) ? config.ffmpegThreads : 1
+  return ['-nostdin', '-loglevel', 'error', '-y', '-i', input, '-filter_threads', String(threads), '-c:v', 'libx264', '-threads', String(threads),
+    '-preset', config.videoPreset, '-crf', String(config.videoCrf), '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output]
+}
 async function convertVideoForR2(bytes, config, signal, ffmpegPath) {
   if (bytes.length > config.maxVideoBytes) return undefined
   const directory = await mkdtemp(join(tmpdir(), 'prismflow-media-video-')); const input = join(directory, 'input'); const output = join(directory, 'output.mp4')
   try {
     await writeFile(input, bytes, { flag: 'wx' })
     await new Promise((resolve, reject) => {
-      const child = spawn(ffmpegPath, ['-y', '-i', input, '-c:v', 'libx264', '-preset', config.videoPreset, '-crf', String(config.videoCrf), '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output], { shell: false, windowsHide: true, stdio: 'ignore' })
-      let settled = false; const finish = error => { if (settled) return; settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort); error ? reject(error) : resolve() }
-      const abort = () => { child.kill('SIGKILL'); finish(new Error('Video conversion aborted')) }
-      const timer = setTimeout(() => { child.kill('SIGKILL'); finish(new Error('Video conversion timeout')) }, 90_000)
-      signal?.addEventListener('abort', abort, { once: true }); child.once('error', finish); child.once('exit', code => finish(code === 0 ? undefined : new Error('FFmpeg failed'))); if (signal?.aborted) abort()
+      const child = spawn(ffmpegPath, ffmpegVideoArgs(input, output, config), { shell: false, windowsHide: true, stdio: 'ignore' })
+      let settled = false; let forcedError
+      const finish = error => { if (settled) return; settled = true; clearTimeout(timer); signal?.removeEventListener('abort', abort); error ? reject(error) : resolve() }
+      const stop = error => {
+        if (settled || forcedError) return
+        forcedError = error
+        try { if (!child.kill('SIGKILL')) finish(error) } catch { finish(error) }
+      }
+      const abort = () => stop(new Error('Video conversion aborted'))
+      const timeoutMs = Number.isInteger(config.videoConversionTimeoutMs) ? config.videoConversionTimeoutMs : 90_000
+      const timer = setTimeout(() => stop(new Error('Video conversion timeout')), timeoutMs)
+      signal?.addEventListener('abort', abort, { once: true })
+      child.once('error', error => finish(forcedError ?? error))
+      child.once('exit', code => finish(forcedError ?? (code === 0 ? undefined : new Error('FFmpeg failed'))))
+      if (signal?.aborted) abort()
     })
     const converted = await readFile(output); if (!converted.length || converted.length > 32 * 1024 * 1024) throw new Error('Converted video is invalid'); return converted
   } finally { await rm(directory, { recursive: true, force: true }).catch(() => {}) }
@@ -248,8 +286,8 @@ async function generateProductionImage(ctx, config, prompt, execution) {
     bytes = Buffer.from(await image.arrayBuffer())
     sourceMime = String(image.headers.get('content-type') ?? '').split(';', 1)[0].trim().toLowerCase()
   }
-  const converted = await convertImageForR2(bytes, sourceMime, imageConfig)
-  const asset = await ctx.prismProductionMedia.ingest(converted.claimBytes)
+  const converted = await serializeMediaConversion(() => convertImageForR2(bytes, sourceMime, imageConfig), execution.signal)
+  const asset = await serializeMediaConversion(() => ctx.prismProductionMedia.ingest(converted.claimBytes), execution.signal)
   const upload = await ctx.prismPublishers.uploadMedia(r2PublisherId, converted.uploadBytes, converted.uploadMime, { signal: execution.signal })
   return { content: `![生成图片](${upload.publicUrl})`, asset, model: imageConfig.imageModel, size: imageConfig.imageSize }
 }
@@ -314,6 +352,11 @@ async function generateGitHubPushMetadata(ctx, content, execution) {
 }
 
 export function apply(ctx, config) {
+  // Match the main application's resource policy: libvips uses one worker by
+  // default and does not retain its shared cache. This is process-global in
+  // Sharp, as it is in the main PrismFlow WeChat/media runtime.
+  sharp.cache(false)
+  sharp.concurrency(Number.isInteger(config.sharpThreads) ? config.sharpThreads : 1)
   let ffmpegPathKey, ffmpegPathPromise
   const deploymentFfmpegPath = () => {
     const configured = ctx.prismImageGenerationSettings.runtime().ffmpegPath ?? config.ffmpegPath
@@ -327,6 +370,11 @@ export function apply(ctx, config) {
     output: { schema: { type: 'object', additionalProperties: false, properties: { content: { type: 'string', required: true }, mediaAssets: { type: 'array', required: true, items: mediaClaimSchema }, omitted: { type: 'integer', required: true } } }, render: (_args, value) => [{ type: 'text', text: `Processed Markdown media: ${value.mediaAssets.length} images admitted, ${value.omitted} omitted.\n\n${value.content}` }] },
     async execute(args, execution) {
       let content = bounded(args.content, 'content', 32_000)
+      const currentImageSettings = ctx.prismImageGenerationSettings?.runtime?.() ?? config
+      const mediaConfig = { ...config, avifQuality: currentImageSettings.avifQuality ?? config.avifQuality,
+        avifEffort: currentImageSettings.avifEffort ?? config.avifEffort }
+      const deadline = AbortSignal.timeout(Number.isInteger(mediaConfig.mediaProcessingTimeoutMs) ? mediaConfig.mediaProcessingTimeoutMs : 180_000)
+      const signal = execution.signal ? AbortSignal.any([execution.signal, deadline]) : deadline
       const r2PublisherId = ctx.prismPublishers.resolveMediaUploaderId(config.r2PublisherId)
       const discovery = /\]\((https?:\/\/[^\s)]+)\)|src=["'](https?:\/\/[^"']+)["']/giu
       for (const match of content.matchAll(discovery)) {
@@ -350,10 +398,10 @@ export function apply(ctx, config) {
         if (kind === 'image' && domainMatches(host, IMAGE_DELETE_DOMAINS) || kind === 'video' && domainMatches(host, VIDEO_DELETE_DOMAINS)) { removeMedia(url); continue }
         let response; let bytes
         try {
-          response = await (ctx.get?.('prismMediaFetch') ?? mediaFetch)(decodeMarkdownMediaUrl(url), { kind, signal: execution.signal })
+          response = await (ctx.get?.('prismMediaFetch') ?? mediaFetch)(decodeMarkdownMediaUrl(url), { kind, signal })
           bytes = Buffer.from(await response.arrayBuffer())
         } catch (error) {
-          if (execution.signal.aborted) throw error
+          if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : error
           // Preserve the original tool's tri-state result: confirmed terminal
           // HTTP/network failures delete, while rate limits, rejected redirects,
           // MIME/size policy failures and unexpected fetch errors leave the
@@ -365,40 +413,46 @@ export function apply(ctx, config) {
           let converted
           try {
             const sourceMime = String(response.headers.get('content-type') ?? '').split(';', 1)[0].trim().toLowerCase()
-            converted = await convertImageForR2(bytes, sourceMime, config)
-          } catch {
+            converted = await serializeMediaConversion(() => convertImageForR2(bytes, sourceMime, mediaConfig), signal)
+          } catch (error) {
+            if (signal.aborted) throw signal.reason instanceof Error ? signal.reason : error
             // Sharp conversion failure was an explicit DELETE_SENTINEL in the
             // original implementation.
             removeMedia(url); continue
           }
           try {
-            const claim = await ctx.prismProductionMedia.ingest(converted.claimBytes)
-            const upload = await ctx.prismPublishers.uploadMedia(r2PublisherId, converted.uploadBytes, converted.uploadMime, { signal: execution.signal })
+            const claim = await serializeMediaConversion(
+              () => ctx.prismProductionMedia.ingest(converted.claimBytes), signal)
+            const upload = await ctx.prismPublishers.uploadMedia(r2PublisherId, converted.uploadBytes, converted.uploadMime, { signal })
             if (!assets.some(item => item.assetId === claim.assetId)) assets.push(claim)
             if (upload?.publicUrl) results.set(url, upload.publicUrl)
           } catch (error) {
-            if (execution.signal.aborted || hardMediaConfigurationError(error)) throw error
+            if (signal.aborted || hardMediaConfigurationError(error)) throw signal.aborted && signal.reason instanceof Error ? signal.reason : error
             // Storage/upload failure left the original URL unchanged.
           }
           continue
         }
-        if (bytes.length > config.maxVideoBytes) {
+        if (bytes.length > mediaConfig.maxVideoBytes) {
           if (domainMatches(host, LARGE_VIDEO_DELETE_DOMAINS)) removeMedia(url)
           continue
         }
-        let converted
-        try { converted = await convertVideoForR2(bytes, config, execution.signal, await deploymentFfmpegPath()) }
-        catch (error) {
-          if (execution.signal.aborted || hardMediaConfigurationError(error)) throw error
+        let converted; let uploadMime = String(response.headers.get('content-type') ?? '').split(';', 1)[0].trim().toLowerCase()
+        try {
+          if (mediaConfig.convertVideos === false) converted = bytes
+          else converted = await serializeMediaConversion(
+            async () => convertVideoForR2(bytes, mediaConfig, signal, await deploymentFfmpegPath()), signal)
+        } catch (error) {
+          if (signal.aborted || hardMediaConfigurationError(error)) throw signal.aborted && signal.reason instanceof Error ? signal.reason : error
           // FFmpeg conversion failure was an explicit DELETE_SENTINEL.
           removeMedia(url); continue
         }
         if (!converted) continue
+        if (mediaConfig.convertVideos !== false) uploadMime = 'video/mp4'
         try {
-          const upload = await ctx.prismPublishers.uploadMedia(r2PublisherId, converted, 'video/mp4', { signal: execution.signal })
+          const upload = await ctx.prismPublishers.uploadMedia(r2PublisherId, converted, uploadMime, { signal })
           if (upload?.publicUrl) results.set(url, upload.publicUrl)
         } catch (error) {
-          if (execution.signal.aborted || hardMediaConfigurationError(error)) throw error
+          if (signal.aborted || hardMediaConfigurationError(error)) throw signal.aborted && signal.reason instanceof Error ? signal.reason : error
           // Storage/upload failure left the original URL unchanged.
         }
       }
